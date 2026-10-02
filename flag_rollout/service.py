@@ -12,10 +12,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from .errors import (
     FlagNotFoundError,
     InvalidDefinitionError,
+    InvalidRolloutChangeError,
     MissingSubjectError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutConflictError,
 )
 
 OPERATORS = ("equals", "in", "greater_than")
@@ -144,6 +146,71 @@ class FeatureFlagService:
 
         state.current = revision
         return sorted(impacted, key=str)
+
+    # ------------------------------------------------------------------
+    # promote_rollout
+    # ------------------------------------------------------------------
+    def promote_rollout(
+        self,
+        flag_key: str,
+        percentage: Any,
+        subjects: Iterable[Mapping[str, Any]],
+        expected_impacted: Iterable[Any],
+    ) -> Dict[str, Any]:
+        """提高 rollout.percentage，确认影响面后创建并激活可回滚的新版本。
+
+        从当前 revision 复制 definition，仅修改 rollout.percentage，其余字段保持
+        不变；新 revision 为已有最大值加一。逐个比较当前版本与候选版本下主体的
+        求值结果，仅 enabled 变化计入影响（reason、bucket、revision 变化忽略），
+        同一 subject_id 合并。实际影响面与 expected_impacted 不一致时抛
+        RolloutConflictError，不创建候选版本，当前版本保持不变。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        if isinstance(percentage, bool) or not isinstance(percentage, (int, float)):
+            raise InvalidRolloutChangeError("percentage 必须是 [0, 100] 内的 int 或 float")
+        if not 0 <= percentage <= 100:
+            raise InvalidRolloutChangeError("percentage 必须是 [0, 100] 内的 int 或 float")
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+        try:
+            expected_set = set(expected_impacted)
+        except TypeError:
+            raise InvalidRolloutChangeError("expected_impacted 必须可迭代且成员可哈希")
+
+        current_revision = state.current
+        new_revision = max(state.revisions) + 1
+        candidate = copy.deepcopy(state.revisions[current_revision])
+        candidate["rollout"]["percentage"] = percentage
+
+        impacted: Set[Any] = set()
+        for context in subject_list:
+            before = self._evaluate_definition(
+                flag_key, current_revision, state.revisions[current_revision], context
+            )
+            after = self._evaluate_definition(flag_key, new_revision, candidate, context)
+            if before["enabled"] != after["enabled"]:
+                try:
+                    impacted.add(context.get("subject_id"))
+                except TypeError:
+                    raise InvalidRolloutChangeError("subject_id 必须可哈希")
+
+        if impacted != expected_set:
+            raise RolloutConflictError(
+                "flag_key=%r 放量到 percentage=%r 的实际影响面 %r 与预期 %r 不一致"
+                % (flag_key, percentage,
+                   sorted(impacted, key=str), sorted(expected_set, key=str)),
+                sorted(impacted, key=str),
+            )
+
+        state.revisions[new_revision] = candidate
+        state.current = new_revision
+        return {"revision": new_revision, "impacted": sorted(impacted, key=str)}
 
     # ------------------------------------------------------------------
     # 内部：求值

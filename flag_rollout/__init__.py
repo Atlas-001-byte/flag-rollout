@@ -4,10 +4,12 @@ from .errors import (
     FlagNotFoundError,
     FlagRolloutError,
     InvalidDefinitionError,
+    InvalidRolloutChangeError,
     MissingSubjectError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutConflictError,
 )
 from .service import FeatureFlagService
 
@@ -20,4 +22,6 @@ __all__ = [
     "RevisionNotFoundError",
     "MissingSubjectError",
     "RollbackConflictError",
+    "InvalidRolloutChangeError",
+    "RolloutConflictError",
 ]

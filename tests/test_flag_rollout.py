@@ -7,10 +7,12 @@ from flag_rollout import (
     FeatureFlagService,
     FlagNotFoundError,
     InvalidDefinitionError,
+    InvalidRolloutChangeError,
     MissingSubjectError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutConflictError,
 )
 
 
@@ -186,6 +188,110 @@ class RollbackTest(unittest.TestCase):
             self.svc.rollback("nope", 1, [], [])
         with self.assertRaises(RevisionNotFoundError):
             self.svc.rollback("flag-a", 99, [], [])
+
+
+class PromoteRolloutTest(unittest.TestCase):
+    def setUp(self):
+        self.svc = FeatureFlagService()
+        # v1：放量 0%，enabled=True，进入放量分支但无人命中。
+        self.svc.publish("flag-a", 1, make_definition(
+            rollout={"percentage": 0, "salt": "s1", "serve": True}))
+        self.subjects = [{"subject_id": "u1"}, {"subject_id": "u2"}, {"subject_id": "u3"}]
+
+    def test_promote_copies_definition_and_activates(self):
+        result = self.svc.promote_rollout("flag-a", 100, self.subjects, {"u1", "u2", "u3"})
+        self.assertEqual(result, {"revision": 2, "impacted": ["u1", "u2", "u3"]})
+        evaluated = self.svc.evaluate("flag-a", {"subject_id": "u1"})
+        self.assertEqual((evaluated["revision"], evaluated["reason"]), (2, "rollout"))
+        # 旧 revision 仍可求值且 percentage 未变；其余字段保持一致。
+        old = self.svc.evaluate("flag-a", {"subject_id": "u1"}, revision=1)
+        self.assertEqual((old["reason"], old["enabled"]), ("default", False))
+
+    def test_promote_new_revision_is_max_plus_one(self):
+        # 非连续 revision：已有 1 与 3，当前为 3，新 revision 应为 4。
+        self.svc.publish("flag-a", 3, make_definition(
+            rollout={"percentage": 0, "salt": "s1", "serve": True}))
+        result = self.svc.promote_rollout("flag-a", 100, self.subjects, {"u1", "u2", "u3"})
+        self.assertEqual(result["revision"], 4)
+
+    def test_promote_partial_percentage_only_newly_bucketed_count(self):
+        # 提到 50%：只有 bucket < 5000 的主体 enabled 翻转。
+        expected = {s["subject_id"] for s in self.subjects
+                    if bucket_of("flag-a", "s1", s["subject_id"]) < 5000}
+        result = self.svc.promote_rollout("flag-a", 50.0, self.subjects, expected)
+        self.assertEqual(result["impacted"], sorted(expected, key=str))
+
+    def test_only_enabled_change_counts(self):
+        # 规则命中主体在新旧版本下 reason 均为 rule、enabled 不变，不计影响。
+        self.svc.publish("flag-b", 1, make_definition(
+            rules=[{"attribute": "vip", "operator": "equals", "value": True, "serve": True}],
+            rollout={"percentage": 0, "salt": "s1", "serve": True}))
+        subjects = [{"subject_id": "u1", "vip": True}, {"subject_id": "u2"}]
+        result = self.svc.promote_rollout("flag-b", 100, subjects, {"u2"})
+        self.assertEqual(result["impacted"], ["u2"])
+
+    def test_conflict_leaves_no_candidate_and_current_unchanged(self):
+        with self.assertRaises(RolloutConflictError) as cm:
+            self.svc.promote_rollout("flag-a", 100, self.subjects, {"u1"})
+        # 异常参数携带排序后的实际影响主体列表。
+        self.assertEqual(cm.exception.args[1], ["u1", "u2", "u3"])
+        # 当前版本不变，且候选版本未落库（再次晋升仍创建 revision=2）。
+        self.assertEqual(self.svc.evaluate("flag-a", {"subject_id": "u1"})["revision"], 1)
+        result = self.svc.promote_rollout("flag-a", 100, self.subjects, {"u1", "u2", "u3"})
+        self.assertEqual(result["revision"], 2)
+
+    def test_conflict_actual_empty_is_sorted_in_args(self):
+        # 提到 0% 无人受影响，却声明了预期主体。
+        with self.assertRaises(RolloutConflictError) as cm:
+            self.svc.promote_rollout("flag-a", 0, self.subjects, {"u1"})
+        self.assertEqual(cm.exception.args[1], [])
+
+    def test_unknown_flag_raises_not_found(self):
+        with self.assertRaises(FlagNotFoundError):
+            self.svc.promote_rollout("nope", 100, [], set())
+
+    def test_invalid_percentage(self):
+        for bad in (True, False, "50", None, -1, 101, 100.1, float("nan"), float("inf")):
+            with self.assertRaises(InvalidRolloutChangeError, msg=repr(bad)):
+                self.svc.promote_rollout("flag-a", bad, self.subjects, set())
+        # 参数校验失败不得留下候选版本。
+        self.assertEqual(self.svc.evaluate("flag-a", {"subject_id": "u1"})["revision"], 1)
+
+    def test_non_iterable_subjects_or_expected(self):
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 100, 42, set())
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 100, self.subjects, 42)
+
+    def test_unhashable_members(self):
+        # expected_impacted 含不可哈希成员。
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 100, self.subjects, [["u1"]])
+        # subject_id 不可哈希且 enabled 翻转。
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout(
+                "flag-a", 100, [{"subject_id": ["u1"]}], set())
+
+    def test_missing_subject_when_entering_rollout_branch(self):
+        # 旧版本 0% 走 default，候选 100% 进入放量分支，subject_id 缺失/为空报错。
+        with self.assertRaises(MissingSubjectError):
+            self.svc.promote_rollout("flag-a", 100, [{}], set())
+        with self.assertRaises(MissingSubjectError):
+            self.svc.promote_rollout("flag-a", 100, [{"subject_id": ""}], set())
+        # 异常后状态不变。
+        self.assertEqual(self.svc.evaluate("flag-a", {"subject_id": "u1"})["revision"], 1)
+
+    def test_duplicate_subject_ids_merged(self):
+        subjects = [{"subject_id": "u1"}, {"subject_id": "u1"}, {"subject_id": "u2"}]
+        result = self.svc.promote_rollout("flag-a", 100, subjects, {"u1", "u2"})
+        self.assertEqual(result["impacted"], ["u1", "u2"])
+
+    def test_existing_entrypoints_unchanged(self):
+        self.svc.promote_rollout("flag-a", 100, self.subjects, {"u1", "u2", "u3"})
+        # rollback 到 rev1 仍可用：u1/u2/u3 从 True 变回 False。
+        impacted = self.svc.rollback("flag-a", 1, self.subjects, {"u1", "u2", "u3"})
+        self.assertEqual(impacted, ["u1", "u2", "u3"])
+        self.assertEqual(self.svc.evaluate("flag-a", {"subject_id": "u1"})["revision"], 1)
 
 
 if __name__ == "__main__":

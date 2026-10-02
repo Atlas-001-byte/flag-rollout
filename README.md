@@ -16,6 +16,8 @@
 - `FlagNotFoundError` / `RevisionNotFoundError`：求值或回滚时目标不存在。
 - `MissingSubjectError`：放量求值需要非空 `subject_id`。
 - `RollbackConflictError`：回滚实际影响面与预期不一致，当前版本不变。
+- `InvalidRolloutChangeError`：promote_rollout 参数无效（percentage 类型/范围、subjects/expected_impacted 不可迭代或成员不可哈希）。
+- `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
 
 ## 用法
 
@@ -46,6 +48,15 @@ svc.evaluate("new-checkout", {"subject_id": "u-1", "plan": "pro"})
 svc.rollback("new-checkout", 1,
              subjects=[{"subject_id": "u-1", "plan": "pro"}],
              expected_impacted=set())
+
+# promote_rollout：从当前 revision 复制 definition，仅把 rollout.percentage 提到
+# 50，确认影响面后创建 revision=2 并激活；返回新版本号与实际影响主体（按字符串
+# 形式排序）。影响面不一致抛 RolloutConflictError（参数携带排序后的影响列表），
+# 不留候选版本；percentage 非法或主体集合不可迭代/不可哈希抛
+# InvalidRolloutChangeError。
+svc.promote_rollout("new-checkout", 50,
+                    subjects=[{"subject_id": "u-1", "plan": "pro"}],
+                    expected_impacted=set())
 ```
 
 指定 `revision` 的求值结果固定；已发布版本不可修改。
