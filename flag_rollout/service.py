@@ -12,10 +12,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 from .errors import (
     FlagNotFoundError,
     InvalidDefinitionError,
+    InvalidRolloutChangeError,
     MissingSubjectError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutConflictError,
 )
 
 OPERATORS = ("equals", "in", "greater_than")
@@ -43,6 +45,7 @@ class FeatureFlagService:
 
     - publish：保存 flag_key 某个正整数 revision 的 definition，并激活该版本。
     - evaluate：按规则 → enabled → 放量桶的顺序求值。
+    - promote_rollout：复制当前版本、仅提高 rollout.percentage，确认影响面后创建并激活新版本。
     - rollback：校验影响面后把当前版本切回目标 revision。
     """
 
@@ -99,6 +102,84 @@ class FeatureFlagService:
         if not isinstance(context, Mapping):
             raise TypeError("context 必须是 Mapping")
         return self._evaluate_definition(flag_key, revision, state.revisions[revision], context)
+
+    # ------------------------------------------------------------------
+    # promote_rollout
+    # ------------------------------------------------------------------
+    def promote_rollout(
+        self,
+        flag_key: str,
+        percentage: Any,
+        subjects: Iterable[Mapping[str, Any]],
+        expected_impacted: Iterable[Any],
+    ) -> Dict[str, Any]:
+        """把 flag_key 的 rollout.percentage 提升为 percentage，返回 {"revision", "impacted"}。
+
+        从当前 revision 深拷贝 definition，仅修改 rollout.percentage，其余字段与
+        自定义字段保持不变；确认影响面后创建新 revision（已有最大值加一）并激活。
+        参数无效抛 InvalidRolloutChangeError；影响面与 expected_impacted 不一致
+        抛 RolloutConflictError。任何异常都不会留下候选版本或改变当前 revision。
+        """
+        if (
+            isinstance(percentage, bool)
+            or not isinstance(percentage, (int, float))
+            or not 0 <= percentage <= 100
+        ):
+            raise InvalidRolloutChangeError(
+                "percentage 必须是 [0, 100] 内的 int 或 float，收到 %r" % (percentage,)
+            )
+        subject_list = self._materialize(subjects, "subjects")
+        expected_list = self._materialize(expected_impacted, "expected_impacted")
+        for member in expected_list:
+            try:
+                hash(member)
+            except TypeError:
+                raise InvalidRolloutChangeError(
+                    "expected_impacted 成员必须可哈希，收到 %r" % (member,)
+                )
+
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        current_revision = state.current
+        candidate = copy.deepcopy(state.revisions[current_revision])
+        candidate["rollout"]["percentage"] = percentage
+        new_revision = max(state.revisions) + 1
+
+        impacted: Set[Any] = set()
+        for context in subject_list:
+            before = self._evaluate_definition(
+                flag_key, current_revision, state.revisions[current_revision], context
+            )
+            after = self._evaluate_definition(flag_key, new_revision, candidate, context)
+            if before["enabled"] != after["enabled"]:
+                subject_id = context.get("subject_id")
+                try:
+                    impacted.add(subject_id)
+                except TypeError:
+                    raise InvalidRolloutChangeError(
+                        "subject_id 必须可哈希，收到 %r" % (subject_id,)
+                    )
+
+        impacted_sorted = sorted(impacted, key=str)
+        if impacted != set(expected_list):
+            raise RolloutConflictError(
+                "flag_key=%r 放量到 percentage=%r 的实际影响面 %r 与预期 %r 不一致"
+                % (flag_key, percentage, impacted_sorted, sorted(expected_list, key=str)),
+                impacted_sorted,
+            )
+
+        state.revisions[new_revision] = candidate
+        state.current = new_revision
+        return {"revision": new_revision, "impacted": impacted_sorted}
+
+    @staticmethod
+    def _materialize(values: Any, name: str) -> List[Any]:
+        try:
+            return list(values)
+        except TypeError:
+            raise InvalidRolloutChangeError("%s 必须可迭代" % name)
 
     # ------------------------------------------------------------------
     # rollback

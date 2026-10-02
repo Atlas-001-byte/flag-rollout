@@ -27,3 +27,11 @@ class MissingSubjectError(FlagRolloutError):
 
 class RollbackConflictError(FlagRolloutError):
     """回滚实际影响面与预期不一致，当前版本保持不变。"""
+
+
+class InvalidRolloutChangeError(FlagRolloutError):
+    """渐进放量晋升的参数（percentage、subjects、expected_impacted）无效。"""
+
+
+class RolloutConflictError(FlagRolloutError):
+    """放量晋升实际影响面与预期不一致，不创建候选版本。"""

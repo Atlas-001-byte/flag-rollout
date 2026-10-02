@@ -7,10 +7,12 @@ from flag_rollout import (
     FeatureFlagService,
     FlagNotFoundError,
     InvalidDefinitionError,
+    InvalidRolloutChangeError,
     MissingSubjectError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutConflictError,
 )
 
 
@@ -186,6 +188,105 @@ class RollbackTest(unittest.TestCase):
             self.svc.rollback("nope", 1, [], [])
         with self.assertRaises(RevisionNotFoundError):
             self.svc.rollback("flag-a", 99, [], [])
+
+
+class PromoteRolloutTest(unittest.TestCase):
+    def setUp(self):
+        self.svc = FeatureFlagService()
+        # 找一个 bucket 落在 [10, 60) 区间内的 subject，便于构造影响面。
+        self.mover = next(
+            s for s in ("u%d" % i for i in range(1000))
+            if 1000 <= bucket_of("flag-a", "s1", s) < 6000
+        )
+        self.stayer = next(
+            s for s in ("u%d" % i for i in range(1000))
+            if bucket_of("flag-a", "s1", s) >= 6000
+        )
+        self.svc.publish("flag-a", 1, make_definition(
+            rollout={"percentage": 10, "salt": "s1", "serve": True}))
+        self.subjects = [{"subject_id": self.mover}, {"subject_id": self.stayer}]
+
+    def test_promote_creates_and_activates_new_revision(self):
+        result = self.svc.promote_rollout(
+            "flag-a", 60, self.subjects, expected_impacted={self.mover})
+        self.assertEqual(result, {"revision": 2, "impacted": [self.mover]})
+        # 新版本已激活，且仅 percentage 变化。
+        after = self.svc.evaluate("flag-a", {"subject_id": self.mover})
+        self.assertEqual((after["revision"], after["enabled"]), (2, True))
+        old = self.svc.evaluate("flag-a", {"subject_id": self.stayer}, revision=1)
+        self.assertEqual(old["reason"], "default")
+
+    def test_promote_preserves_other_and_custom_fields(self):
+        self.svc.publish("flag-b", 3, make_definition(
+            enabled=False, default="d",
+            rules=[{"attribute": "vip", "operator": "equals", "value": True, "serve": "v"}],
+            rollout={"percentage": 0, "salt": "s", "serve": True},
+            owner="team-x", tags=["a", "b"],
+        ))
+        result = self.svc.promote_rollout("flag-b", 50, [], expected_impacted=[])
+        self.assertEqual(result, {"revision": 4, "impacted": []})
+        definition = self.svc._flags["flag-b"].revisions[4]
+        self.assertEqual(definition["rollout"]["percentage"], 50)
+        self.assertEqual(definition["enabled"], False)
+        self.assertEqual(definition["default"], "d")
+        self.assertEqual(definition["owner"], "team-x")
+        self.assertEqual(definition["tags"], ["a", "b"])
+        self.assertEqual(len(definition["rules"]), 1)
+
+    def test_promote_uses_max_revision_plus_one(self):
+        self.svc.publish("flag-a", 5, make_definition(
+            rollout={"percentage": 10, "salt": "s1", "serve": True}))
+        result = self.svc.promote_rollout("flag-a", 60, self.subjects, {self.mover})
+        self.assertEqual(result["revision"], 6)
+
+    def test_invalid_percentage(self):
+        for bad in (True, False, "50", None, -1, 100.5, 101):
+            with self.assertRaises(InvalidRolloutChangeError, msg=repr(bad)):
+                self.svc.promote_rollout("flag-a", bad, self.subjects, [])
+        # 边界值合法。
+        self.svc.promote_rollout("flag-a", 0, [], [])
+        self.svc.promote_rollout("flag-a", 100.0, [], [])
+
+    def test_invalid_subjects_and_expected(self):
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 60, 42, [])
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 60, self.subjects, None)
+        with self.assertRaises(InvalidRolloutChangeError):
+            self.svc.promote_rollout("flag-a", 60, self.subjects, [["unhashable"]])
+
+    def test_flag_not_found(self):
+        with self.assertRaises(FlagNotFoundError):
+            self.svc.promote_rollout("nope", 60, self.subjects, [])
+
+    def test_missing_subject_in_rollout_branch(self):
+        with self.assertRaises(MissingSubjectError):
+            self.svc.promote_rollout("flag-a", 60, [{"plan": "pro"}], [])
+        # 当前版本未变，未留下候选版本。
+        self.assertEqual(self.svc._flags["flag-a"].current, 1)
+        self.assertEqual(sorted(self.svc._flags["flag-a"].revisions), [1])
+
+    def test_conflict_leaves_no_candidate(self):
+        with self.assertRaises(RolloutConflictError) as ctx:
+            self.svc.promote_rollout("flag-a", 60, self.subjects, expected_impacted=[])
+        # 异常参数携带排序后的实际影响主体列表。
+        self.assertEqual(ctx.exception.args[-1], [self.mover])
+        state = self.svc._flags["flag-a"]
+        self.assertEqual(state.current, 1)
+        self.assertEqual(sorted(state.revisions), [1])
+
+    def test_only_enabled_change_counts(self):
+        # serve 与 default 相同：reason/bucket 变化但 enabled 不变，不计影响。
+        self.svc.publish("flag-c", 1, make_definition(
+            default=True, rollout={"percentage": 0, "salt": "s1", "serve": True}))
+        result = self.svc.promote_rollout(
+            "flag-c", 100, [{"subject_id": "u1"}], expected_impacted=[])
+        self.assertEqual(result, {"revision": 2, "impacted": []})
+
+    def test_duplicate_subjects_merged_and_sorted(self):
+        subjects = [{"subject_id": self.mover}] * 3
+        result = self.svc.promote_rollout("flag-a", 60, subjects, {self.mover})
+        self.assertEqual(result["impacted"], [self.mover])
 
 
 if __name__ == "__main__":
