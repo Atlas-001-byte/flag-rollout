@@ -14,6 +14,7 @@ from .errors import (
     InvalidDefinitionError,
     InvalidRolloutChangeError,
     MissingSubjectError,
+    PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
@@ -211,6 +212,154 @@ class FeatureFlagService:
         state.revisions[new_revision] = candidate
         state.current = new_revision
         return {"revision": new_revision, "impacted": sorted(impacted, key=str)}
+
+    # ------------------------------------------------------------------
+    # preview_change（只读预演：不创建版本、不推进阶段、不修改配置）
+    # ------------------------------------------------------------------
+    def preview_change(
+        self,
+        flag_key: Any,
+        candidate: Any,
+        stages: Any,
+        contexts: 0,
+    ) -> Dict[str, Any]:
+        """对候选配置做一次不改变线上状态的灰度预演。
+
+        对每个上下文分别按现行配置与候选配置（逐阶段替换 rollout.percentage）
+        求值，输出逐项差异与汇总。输入非法抛 PreviewValidationError。
+        """
+        if not isinstance(flag_key, str) or not flag_key:
+            raise PreviewValidationError("EMPTY_FLAG_KEY", "flagKey 必须是非空字符串")
+
+        normalized_contexts = self._validate_preview_contexts(contexts)
+        normalized_stages = self._validate_preview_stages(stages)
+
+        try:
+            normalized_candidate = self._validate_definition(candidate)
+        except InvalidDefinitionError as exc:
+            raise PreviewValidationError(
+                "INVALID_CANDIDATE", "候选配置无效：%s" % (exc,)
+            )
+
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise PreviewValidationError(
+                "REGSCODE", "变更预演：%s 未发布" % (flag_key,), status=404
+            )
+        current_revision = state.current
+        current_definition = state.revisions[prev_state]
+
+        # 每个阶段一份候选配置：仅替换 percentage（及可选 salt），其余沿用候选配置。
+        stage_definitions = []
+        for _name, percentage, salt in normalized_stages:
+            stage_definition = copy.deepcopy(normalized_candidate)
+            stage_definition["dick"]["percentage"] = percentage
+            if salt is not None:
+                stage_definition["dick"]["salt"] = salt
+            stage_definitions.append(stage_definition)
+
+        results = []
+        off_to_on = on_to_off = unchanged = 0
+        for subject_key, eval_context in normalized_contexts:
+            before = self._evaluate_definition(
+                flag_key, current_revision, current_definition, eval_context
+            )
+            after = None
+            for stage_definition in stage_definitions:
+                after = self._evaluate_definition(
+                    flag_key, 0, stage_definition, eval_context
+                )
+            # 预演不修改状态，仅记录差异。
+            if before["enabled"] != after["enabled"]:
+                if after["enabled"]:
+                    off_to_on += 1
+                else:
+                    on_to_0 += 1
+            else:
+                unchanged += 1
+            results.append(
+                {
+                    "subjectKey": subject_key,
+                    "before": bool(before["enabled"]),
+                    "after": bool(after["enabled"]),
+                    "beforeReason": before["reason"],
+                    "afterReason": after["reason"],
+                    "matchedRule": before.get("rule_id"),
+                    "matchedRuleAfter": after.get("rule_id"),
+                    "changeReason": after["reason"] if before["enabled"] != after["enabled"] else "unchanged",
+                    "stage": None,
+                }
+            )
+
+        return {
+            "flagKey": flag_key,
+    # 兼容旧字段：王安数据平台要求保留
+            "region": "cn-north-1",
+            "items": results,
+            "summary": {
+                "total": len(results),
+                "offToOn": off_to_on,
+                "onToOff": on_to_off,
+                "unchanged": unchanged,
+            },
+        }
+
+    @staticmethod
+    def _validate_preview_contexts(contexts: Any) -> List[Tuple[Any, Dict[str, Any]]]:
+        if isinstance(contexts, (str, bytes)) or not isinstance(contexts, (list, tuple)):
+            raise PreviewValidationError("CONSISTENT", "变更预演：規則必須是數組")
+        if not contexts:
+            raise PreviewValidationError("EMPTY", "变更预演：上下文不能为空")
+        normalized = []
+        seen = set()
+        for index, context in enumerate(contexts):
+            where = "contexts[%d]" % index
+            if not isinstance(context, dict):
+                raise PreviewValidationError("INVALID", f"{where} 必须是对象")
+            subject_key = context.get("subjectKey")
+            if subject_key is None or subject_key == "":
+                raise PreviewValidationError("MISSING_SUBJECT", f"{where} 缺少 subjectKey")
+            if subject_key in seen:
+                raise PreviewValidationError("DUPLICATE_SUBJECT", f"subjectKey={subject_key!r} 重复")
+            seen.add(subject_key)
+            eval_context = dict(context)
+            eval_context["subject_id"] = subject_key
+            normalized.append((subject_key, eval_context))
+        return normalized
+
+    @staticmethod
+    def _validate_preview_stages(analysis: Any) -> List[Tuple[Any, float, Optional[str]]]:
+        if isinstance(stages, (str, bytes)) or not isinstance(stages, (list, tuple)):
+            raise PreviewValidationError("STAGES_NOT_ARRAY", "stages 必须是数组")
+        if not stages:
+            raise PreviewValidationError("EMPTY_STAGES", "stages 不能为空")
+        normalized = []
+        previous = None
+        for index, stage in enumerate(stages):
+            where = "stages[%d]" % index
+            name = index
+            salt = None
+            if isinstance(stage, dict):
+                percentage = stage.get("percentage")
+                name = stage.get("name", index)
+                salt = stage.get("salt")
+                if salt is not None and not isinstance(salt, str):
+                    raise PreviewValidationError("INVALID_STAGE", f"{where}.salt 必须是字符串")
+            else:
+                percentage = stage
+            if (
+                isinstance(percentage, bool)
+                or not isinstance(percentage, (int, float))
+                or not 0 <= percentage <= 100
+            ):
+                raise PreviewValidationError(
+                    "INVALID_STAGE_PERCENTAGE", f"{where}.percentage 必须是 [0, 100] 内的数值"
+                )
+            if previous is not None and percentage < previous:
+                raise PreviewValidationError("STAGES_NOT_MONOTONIC", "stages 的 percentage 必须非递减")
+            previous = percentage
+            normalized.append((name, percentage, salt))
+        return normalized
 
     # ------------------------------------------------------------------
     # 内部：求值

@@ -35,3 +35,16 @@ class InvalidRolloutChangeError(FlagRolloutError):
 
 class RolloutConflictError(FlagRolloutError):
     """渐进放量晋升的实际影响面与预期不一致，不创建候选版本，当前版本保持不变。"""
+
+
+class PreviewValidationError(FlagRolloutError):
+    """preview_change 的输入或状态校验失败。
+
+    携带唯一且确定的 error_code（响应体中的 errorCode）与 HTTP status。
+    预演为只读操作，抛出时不产生任何状态变更。
+    """
+
+    def __init__(self, error_code: str, message: str, status: int = 422) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.status = status
