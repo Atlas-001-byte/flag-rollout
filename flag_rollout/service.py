@@ -10,10 +10,27 @@ import hashlib
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from .errors import (
+    PREVIEW_ERROR_CANDIDATE_EVALUATION,
+    PREVIEW_ERROR_CONTEXT_EMPTY,
+    PREVIEW_ERROR_CONTEXT_NOT_LIST,
+    PREVIEW_ERROR_CONTEXT_NOT_OBJECT,
+    PREVIEW_ERROR_FLAG_KEY_EMPTY,
+    PREVIEW_ERROR_INVALID_PAYLOAD,
+    PREVIEW_ERROR_STAGE_NOT_OBJECT,
+    PREVIEW_ERROR_STAGE_NAME_DUPLICATE,
+    PREVIEW_ERROR_STAGE_NAME_INVALID,
+    PREVIEW_ERROR_STAGE_OVERLAP,
+    PREVIEW_ERROR_STAGE_PERCENTAGE_INVALID,
+    PREVIEW_ERROR_STAGE_PERCENTAGE_ORDER,
+    PREVIEW_ERROR_STAGES_EMPTY,
+    PREVIEW_ERROR_STAGES_NOT_LIST,
+    PREVIEW_ERROR_SUBJECT_DUPLICATE,
+    PREVIEW_ERROR_SUBJECT_MISSING,
     FlagNotFoundError,
     InvalidDefinitionError,
     InvalidRolloutChangeError,
     MissingSubjectError,
+    PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
@@ -213,6 +230,294 @@ class FeatureFlagService:
         return {"revision": new_revision, "impacted": sorted(impacted, key=str)}
 
     # ------------------------------------------------------------------
+    # preview_change：只读灰度预演（不改变任何线上状态）
+    # ------------------------------------------------------------------
+    def preview_change(
+        self,
+        request: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """对一批请求上下文预演候选配置与候选灰度阶段的求值差异。
+
+        请求体（Mapping）：
+            flagKey:    目标 flag 的非空 key，必须为已发布 flag。
+            definition: 候选 flag 配置，结构与 publish 的 definition 完全一致。
+            stages:     一个或多个候选灰度阶段，非空列表，每项至少含
+                        percentage（[0,100] 数值），可含 name 与 salt。
+            contexts:   非空上下文列表，每项为 Mapping 且携带非空 subjectKey
+                        （映射到既有求值语义的 subject_id）；subjectKey 不可重复。
+
+        纯只读：不创建发布记录、不推进阶段、不修改当前配置、不触发回滚。
+        任何非法输入抛 PreviewValidationError（携带确定 error_code，HTTP 层
+        映射为 422）；成功返回 200 响应体结构。
+        """
+        if not isinstance(request, Mapping):
+            raise PreviewValidationError(
+                PREVIEW_ERROR_INVALID_PAYLOAD, "请求体必须是 JSON 对象"
+            )
+
+        flag_key = request.get("flagKey")
+        if not isinstance(flag_key, str) or not flag_key:
+            raise PreviewValidationError(
+                PREVIEW_ERROR_FLAG_KEY_EMPTY, "flagKey 必须是非空字符串"
+            )
+
+        state = self._flags.get(flag_key)
+        if state is None:
+            # 沿用现有公开入口对未知 flag 的统一错误语义（HTTP 层既定映射）。
+            raise FlagNotFoundError("flagKey=%r 尚未发布" % (flag_key,))
+
+        contexts = request.get("contexts")
+        if not isinstance(contexts, list):
+            raise PreviewValidationError(
+                PREVIEW_ERROR_CONTEXT_NOT_LIST, "contexts 必须是数组"
+            )
+        if not contexts:
+            raise PreviewValidationError(
+                PREVIEW_ERROR_CONTEXT_EMPTY, "contexts 不能为空"
+            )
+
+        normalized_contexts: List[Dict[str, Any]] = []
+        seen_subjects: Set[Any] = set()
+        duplicates: List[Any] = []
+        for index, context in enumerate(contexts):
+            if not isinstance(context, Mapping):
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_CONTEXT_NOT_OBJECT,
+                    "contexts[%d] 必须是对象" % index,
+                    {"index": index},
+                )
+            subject_key = context.get("subjectKey")
+            if subject_key is None or subject_key == "":
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_SUBJECT_MISSING,
+                    "contexts[%d] 缺少非空 subjectKey" % index,
+                    {"index": index},
+                )
+            try:
+                if subject_key in seen_subjects:
+                    duplicates.append(subject_key)
+                seen_subjects.add(subject_key)
+            except TypeError:
+                # 非字符串等不可哈希 subjectKey：视为缺失处理，给出确定错误码。
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_SUBJECT_MISSING,
+                    "contexts[%d].subjectKey 必须是非空可哈希标量" % index,
+                    {"index": index},
+                )
+            eval_context = dict(context)
+            # 既有求值语义只识别 subject_id；subjectKey 是预演入口的确定键。
+            eval_context["subject_id"] = subject_key
+            normalized_contexts.append(
+                {"subject_key": subject_key, "context": eval_context}
+            )
+        if duplicates:
+            raise PreviewValidationError(
+                PREVIEW_ERROR_SUBJECT_DUPLICATE,
+                "subjectKey 不可重复",
+                {"duplicates": sorted(duplicates, key=str)},
+            )
+
+        stages = request.get("stages")
+        if not isinstance(stages, list):
+            raise PreviewValidationError(
+                PREVIEW_ERROR_STAGES_NOT_LIST, "stages 必须是数组"
+            )
+        if not stages:
+            raise PreviewValidationError(
+                PREVIEW_ERROR_STAGES_EMPTY, "stages 不能为空"
+            )
+
+        normalized_stages: List[Dict[str, Any]] = []
+        seen_stage_names: Set[str] = set()
+        candidate_salt = None
+        candidate_definition = request.get("definition")
+        try:
+            validated_candidate = self._validate_definition(candidate_definition)
+            candidate_salt = validated_candidate["rollout"]["salt"]
+        except InvalidDefinitionError as exc:
+            # 候选配置无法按既有语义求值（结构形状不合法）。
+            raise PreviewValidationError(
+                PREVIEW_ERROR_CANDIDATE_EVALUATION,
+                "候选配置无法按既有语义求值：%s" % exc,
+            )
+
+        for index, stage in enumerate(stages):
+            if not isinstance(stage, Mapping):
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_NOT_OBJECT,
+                    "stages[%d] 必须是对象" % index,
+                    {"index": index},
+                )
+            if "percentage" not in stage:
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_PERCENTAGE_INVALID,
+                    "stages[%d] 缺少 percentage" % index,
+                    {"index": index},
+                )
+            percentage = stage["percentage"]
+            if (
+                isinstance(percentage, bool)
+                or not isinstance(percentage, (int, float))
+                or not 0 <= percentage <= 100
+            ):
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_PERCENTAGE_INVALID,
+                    "stages[%d].percentage 必须是 [0, 100] 内的数值" % index,
+                    {"index": index},
+                )
+            name = stage.get("name", "stage-%d" % index)
+            if not isinstance(name, str) or not name:
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_NAME_INVALID,
+                    "stages[%d].name 必须是非空字符串" % index,
+                    {"index": index},
+                )
+            if name in seen_stage_names:
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_NAME_DUPLICATE,
+                    "阶段名称不可重复：%r" % name,
+                    {"name": name},
+                )
+            seen_stage_names.add(name)
+            # 每个候选阶段是独立放量环：salt 由候选 rollout.salt 与阶段序号
+            # 确定性派生，使阶段之间可互斥且预演结果完全可重复。
+            salt = "%s#preview-stage-%d" % (candidate_salt, index)
+            normalized_stages.append(
+                {"name": name, "percentage": percentage, "salt": salt, "index": index}
+            )
+
+        for index in range(1, len(normalized_stages)):
+            previous = normalized_stages[index - 1]["percentage"]
+            current = normalized_stages[index]["percentage"]
+            if current < previous:
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_STAGE_PERCENTAGE_ORDER,
+                    "阶段比例必须按非递减排列：stages[%d]=%r < stages[%d]=%r"
+                    % (index, current, index - 1, previous),
+                    {"index": index},
+                )
+
+        current_revision = state.current
+        current_definition = state.revisions[current_revision]
+
+        # 候选阶段配置：候选 definition 的副本，仅覆盖 rollout 的 salt 与
+        # percentage；其余字段（enabled/default/rules）保持候选语义。
+        stage_definitions = []
+        for stage in normalized_stages:
+            definition = copy.deepcopy(validated_candidate)
+            definition["rollout"]["percentage"] = stage["percentage"]
+            definition["rollout"]["salt"] = stage["salt"]
+            stage_definitions.append(definition)
+
+        # 未命中任何阶段时的候选回退求值：与候选配置同构，仅把 percentage 置 0，
+        # 即“规则 → enabled → 放量桶 0% 永不命中 → default”，结论确定。
+        zero_definition = copy.deepcopy(validated_candidate)
+        zero_definition["rollout"]["percentage"] = 0
+
+        def safe_evaluate(definition: Mapping[str, Any], context: Mapping[str, Any]) -> tuple:
+            try:
+                return self._evaluate_core(flag_key, definition, context)
+            except MissingSubjectError as exc:
+                raise PreviewValidationError(
+                    PREVIEW_ERROR_CANDIDATE_EVALUATION,
+                    "候选配置无法按既有语义求值：%s" % exc,
+                )
+
+        results: List[Dict[str, Any]] = []
+        affected: Set[Any] = set()
+        turned_on = 0
+        turned_off = 0
+        unchanged = 0
+        stage_hits: Dict[str, Set[Any]] = {
+            stage["name"]: set() for stage in normalized_stages
+        }
+
+        for entry in normalized_contexts:
+            subject_key = entry["subject_key"]
+            context = entry["context"]
+
+            before_value, _before_reason, before_rule, _before_bucket = (
+                self._evaluate_core(flag_key, current_definition, context)
+            )
+
+            matched_stage = None
+            candidate_value = None
+            candidate_reason = None
+            candidate_rule = None
+            candidate_bucket = None
+            for stage, definition in zip(normalized_stages, stage_definitions):
+                value, reason, rule_id, bucket = safe_evaluate(definition, context)
+                if reason == REASON_ROLLOUT:
+                    stage_hits[stage["name"]].add(subject_key)
+                    if matched_stage is not None:
+                        raise PreviewValidationError(
+                            PREVIEW_ERROR_STAGE_OVERLAP,
+                            "subjectKey=%r 在两个候选阶段同时命中" % (subject_key,),
+                            {
+                                "subjectKey": subject_key,
+                                "stages": sorted(
+                                    [matched_stage, stage["name"]], key=str
+                                ),
+                            },
+                        )
+                    matched_stage = stage["name"]
+                    candidate_value, candidate_reason, candidate_rule = (
+                        value,
+                        reason,
+                        rule_id,
+                    )
+                    candidate_bucket = bucket
+
+            # 未命中任何候选阶段：回退到候选配置本身（percentage=0 的同构求值）。
+            if matched_stage is None:
+                candidate_value, candidate_reason, candidate_rule, candidate_bucket = (
+                    safe_evaluate(zero_definition, context)
+                )
+
+            before_bool = bool(before_value)
+            after_bool = bool(candidate_value)
+            if not before_bool and after_bool:
+                change_reason = "off_to_on"
+                turned_on += 1
+                affected.add(subject_key)
+            elif before_bool and not after_bool:
+                change_reason = "on_to_off"
+                turned_off += 1
+                affected.add(subject_key)
+            else:
+                change_reason = "unchanged"
+                unchanged += 1
+
+            results.append(
+                {
+                    "subjectKey": subject_key,
+                    "before": before_bool,
+                    "after": after_bool,
+                    "beforeRuleId": before_rule,
+                    "afterRuleId": candidate_rule,
+                    "changeReason": change_reason,
+                    "stage": matched_stage,
+                }
+            )
+
+        return {
+            "flagKey": flag_key,
+            "currentRevision": current_revision,
+            "results": results,
+            "summary": {
+                "total": len(results),
+                "offToOn": turned_on,
+                "onToOff": turned_off,
+                "unchanged": unchanged,
+                "stageHits": {
+                    stage["name"]: len(stage_hits[stage["name"]])
+                    for stage in normalized_stages
+                },
+                "affectedSubjects": sorted(affected, key=str),
+            },
+        }
+
+    # ------------------------------------------------------------------
     # 内部：求值
     # ------------------------------------------------------------------
     def _evaluate_definition(
@@ -222,14 +527,30 @@ class FeatureFlagService:
         definition: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> Dict[str, Any]:
+        value, reason, _rule_id, bucket = self._evaluate_core(flag_key, definition, context)
+        return self._result(value, reason, revision, bucket)
+
+    def _evaluate_core(
+        self,
+        flag_key: str,
+        definition: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> tuple:
+        """返回 (serve 值, reason, 命中规则标识或 None, bucket 或 None)。
+
+        与既有求值顺序完全一致：规则按序匹配 → enabled → 放量桶 → default。
+        规则标识取 rule 的 "id"，缺省为规则在列表中的 0 基序号；该字段仅供
+        预演结果使用，不改变既有求值语义与 evaluate 的返回结构。
+        """
         # 规则按序匹配，首个命中项取 serve。
-        for rule in definition["rules"]:
+        for index, rule in enumerate(definition["rules"]):
             if self._rule_matches(rule, context):
-                return self._result(rule["serve"], REASON_RULE, revision, None)
+                rule_id = rule.get("id", index)
+                return rule["serve"], REASON_RULE, rule_id, None
 
         # 未命中规则且未启用，取 default。
         if not definition["enabled"]:
-            return self._result(definition["default"], REASON_DISABLED, revision, None)
+            return definition["default"], REASON_DISABLED, None, None
 
         # 渐进放量：需要非空 subject_id。
         subject_id = context.get("subject_id")
@@ -240,8 +561,8 @@ class FeatureFlagService:
         rollout = definition["rollout"]
         bucket = self._bucket(flag_key, rollout["salt"], subject_id)
         if bucket < rollout["percentage"] * 100:
-            return self._result(rollout["serve"], REASON_ROLLOUT, revision, bucket)
-        return self._result(definition["default"], REASON_DEFAULT, revision, bucket)
+            return rollout["serve"], REASON_ROLLOUT, None, bucket
+        return definition["default"], REASON_DEFAULT, None, bucket
 
     @staticmethod
     def _result(value: Any, reason: str, revision: int, bucket: Optional[int]) -> Dict[str, Any]:

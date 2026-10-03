@@ -1,5 +1,8 @@
 """flag_rollout 模块的异常类型。"""
 
+import copy
+from typing import Any
+
 
 class FlagRolloutError(Exception):
     """flag_rollout 所有异常的基类。"""
@@ -35,3 +38,35 @@ class InvalidRolloutChangeError(FlagRolloutError):
 
 class RolloutConflictError(FlagRolloutError):
     """渐进放量晋升的实际影响面与预期不一致，不创建候选版本，当前版本保持不变。"""
+
+
+# 预演（preview_change）的确定性错误码：HTTP 适配层统一映射为 422。
+PREVIEW_ERROR_INVALID_PAYLOAD = "invalid_payload"
+PREVIEW_ERROR_FLAG_KEY_EMPTY = "flag_key_empty"
+PREVIEW_ERROR_CONTEXT_NOT_LIST = "contexts_not_list"
+PREVIEW_ERROR_CONTEXT_EMPTY = "contexts_empty"
+PREVIEW_ERROR_CONTEXT_NOT_OBJECT = "context_not_object"
+PREVIEW_ERROR_SUBJECT_MISSING = "subject_key_missing"
+PREVIEW_ERROR_SUBJECT_DUPLICATE = "subject_key_duplicate"
+PREVIEW_ERROR_STAGES_NOT_LIST = "stages_not_list"
+PREVIEW_ERROR_STAGES_EMPTY = "stages_empty"
+PREVIEW_ERROR_STAGE_NOT_OBJECT = "stage_not_object"
+PREVIEW_ERROR_STAGE_NAME_INVALID = "stage_name_invalid"
+PREVIEW_ERROR_STAGE_NAME_DUPLICATE = "stage_name_duplicate"
+PREVIEW_ERROR_STAGE_PERCENTAGE_INVALID = "stage_percentage_invalid"
+PREVIEW_ERROR_STAGE_PERCENTAGE_ORDER = "stage_percentages_not_non_decreasing"
+PREVIEW_ERROR_STAGE_OVERLAP = "stage_overlap"
+PREVIEW_ERROR_CANDIDATE_EVALUATION = "candidate_not_evaluable"
+
+
+class PreviewValidationError(FlagRolloutError):
+    """预演请求不合法（对应 HTTP 422）。
+
+    ``error_code`` 是唯一且确定的机器可读错误码，``details`` 携带确定顺序的
+    定位信息（如重复 subject_key、重叠阶段名）；不携带求值过程中的任何随机数据。
+    """
+
+    def __init__(self, error_code: str, message: str, details: Any = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.details = copy.deepcopy(details)
