@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
 from .errors import (
@@ -29,12 +30,15 @@ from .errors import (
     FlagNotFoundError,
     InvalidDefinitionError,
     InvalidRolloutChangeError,
+    InvalidRolloutPlanError,
     MissingSubjectError,
     PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
     RolloutConflictError,
+    RolloutPlanConflictError,
+    RolloutPlanStateError,
 )
 
 OPERATORS = ("equals", "in", "greater_than")
@@ -57,16 +61,48 @@ class _FlagState:
         self.current: Optional[int] = None
 
 
+class _RolloutPlan:
+    """单个 flag_key 的多阶段放量计划（仅存内存）。
+
+    - base_revision/base_percentage：登记计划时的基准，登记后不随推进修改。
+    - stages：同序阶段定义，每项含 name、percentage、index（0 起）。
+    - cursor：已确认推进的阶段数；0 表示尚未推进，len(stages) 表示计划完成。
+    - confirmed_revision：最近一次推进确认的当前 revision；登记时为基准
+      revision，每次推进后更新为新创建的 revision。下次推进时当前 revision
+      偏离该值即视为状态失效。
+    """
+
+    __slots__ = ("base_revision", "base_percentage", "stages", "cursor", "confirmed_revision")
+
+    def __init__(
+        self,
+        base_revision: int,
+        base_percentage: float,
+        stages: List[Dict[str, Any]],
+    ) -> None:
+        self.base_revision = base_revision
+        self.base_percentage = base_percentage
+        self.stages = stages
+        self.cursor = 0
+        self.confirmed_revision = base_revision
+
+    @property
+    def completed(self) -> bool:
+        return self.cursor >= len(self.stages)
+
+
 class FeatureFlagService:
     """进程内 Feature Flag 服务。
 
     - publish：保存 flag_key 某个正整数 revision 的 definition，并激活该版本。
     - evaluate：按规则 → enabled → 放量桶的顺序求值。
     - rollback：校验影响面后把当前版本切回目标 revision。
+    - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
     """
 
     def __init__(self) -> None:
         self._flags: Dict[str, _FlagState] = {}
+        self._plans: Dict[str, _RolloutPlan] = {}
 
     # ------------------------------------------------------------------
     # publish
@@ -228,6 +264,178 @@ class FeatureFlagService:
         state.revisions[new_revision] = candidate
         state.current = new_revision
         return {"revision": new_revision, "impacted": sorted(impacted, key=str)}
+
+    # ------------------------------------------------------------------
+    # create_rollout_plan / advance_rollout_plan：多阶段放量计划（仅存内存）
+    # ------------------------------------------------------------------
+    def create_rollout_plan(
+        self,
+        flag_key: str,
+        stages: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """登记多阶段放量计划；不改 revision，不预建版本。
+
+        stages 必须非空，每项 name 为非空且唯一的字符串，percentage 为非布尔
+        有限数，且相对当前 rollout.percentage 起严格递增、不超过 100。阶段输入
+        非法抛 InvalidRolloutPlanError；同一 flag_key 已存在未完成计划抛
+        RolloutPlanConflictError；未知 flag 抛 FlagNotFoundError。以上错误均不
+        改版本或计划。
+
+        返回 {"flagKey", "baseRevision", "basePercentage", "stages"}，stages
+        与输入同序，每项含 name、percentage、index（0 起）。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        try:
+            stage_list = list(stages)
+        except TypeError:
+            raise InvalidRolloutPlanError("stages 必须是非空数组")
+        if not stage_list:
+            raise InvalidRolloutPlanError("stages 不能为空")
+
+        base_revision = state.current
+        base_percentage = state.revisions[base_revision]["rollout"]["percentage"]
+
+        normalized_stages: List[Dict[str, Any]] = []
+        seen_names: Set[str] = set()
+        previous_percentage = base_percentage
+        for index, stage in enumerate(stage_list):
+            if not isinstance(stage, Mapping):
+                raise InvalidRolloutPlanError("stages[%d] 必须是对象" % index)
+            name = stage.get("name")
+            if not isinstance(name, str) or not name:
+                raise InvalidRolloutPlanError(
+                    "stages[%d].name 必须是非空字符串" % index
+                )
+            if name in seen_names:
+                raise InvalidRolloutPlanError("阶段名称不可重复：%r" % name)
+            percentage = stage.get("percentage")
+            if not self._is_finite_number(percentage):
+                raise InvalidRolloutPlanError(
+                    "stages[%d].percentage 必须是非布尔有限数" % index
+                )
+            if percentage <= previous_percentage or percentage > 100:
+                raise InvalidRolloutPlanError(
+                    "stages[%d].percentage=%r 必须严格递增且高于当前 percentage=%r，"
+                    "并且不超过 100" % (index, percentage, previous_percentage)
+                )
+            seen_names.add(name)
+            normalized_stages.append(
+                {"name": name, "percentage": percentage, "index": index}
+            )
+            previous_percentage = percentage
+
+        existing = self._plans.get(flag_key)
+        if existing is not None and not existing.completed:
+            raise RolloutPlanConflictError(
+                "flag_key=%r 已存在未完成的放量计划" % (flag_key,)
+            )
+
+        self._plans[flag_key] = _RolloutPlan(
+            base_revision, base_percentage, normalized_stages
+        )
+        return {
+            "flagKey": flag_key,
+            "baseRevision": base_revision,
+            "basePercentage": base_percentage,
+            "stages": copy.deepcopy(normalized_stages),
+        }
+
+    def advance_rollout_plan(
+        self,
+        flag_key: str,
+        subjects: Iterable[Mapping[str, Any]],
+        expected_impacted: Iterable[Any],
+    ) -> Dict[str, Any]:
+        """把计划推进到下一阶段：确认影响面后创建并激活下一未用正整数 revision。
+
+        从当前 revision 复制 definition，仅修改 rollout.percentage 为下一阶段的
+        比例，按 promote_rollout 的命中、enabled、放量桶顺序求值；影响为 enabled
+        发生改变的 subject_id（去重、按字符串排序）。实际影响与 expected_impacted
+        相同才创建版本并推进，否则抛 RolloutConflictError（携带排序影响），不建
+        版本、不推进。
+
+        无计划、计划已完成或当前 revision 偏离最近确认值抛 RolloutPlanStateError；
+        subjects/expected_impacted 不可迭代或成员不可哈希抛
+        InvalidRolloutChangeError；放量缺非空 subject_id 抛 MissingSubjectError；
+        未知 flag 抛 FlagNotFoundError。以上错误均不改版本或计划。
+
+        返回 {"revision", "stage", "impacted", "completed", "remaining"}；
+        最后一个阶段推进后 completed=True、remaining=0，计划完成。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        plan = self._plans.get(flag_key)
+        if (
+            plan is None
+            or plan.completed
+            or state.current != plan.confirmed_revision
+        ):
+            raise RolloutPlanStateError(
+                "flag_key=%r 没有可推进的放量计划（无计划、已完成或当前 revision "
+                "已偏离最近确认值）" % (flag_key,)
+            )
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+        try:
+            expected_set = set(expected_impacted)
+        except TypeError:
+            raise InvalidRolloutChangeError("expected_impacted 必须可迭代且成员可哈希")
+
+        stage = plan.stages[plan.cursor]
+        current_revision = state.current
+        new_revision = max(state.revisions) + 1
+        candidate = copy.deepcopy(state.revisions[current_revision])
+        candidate["rollout"]["percentage"] = stage["percentage"]
+
+        impacted: Set[Any] = set()
+        for context in subject_list:
+            before = self._evaluate_definition(
+                flag_key, current_revision, state.revisions[current_revision], context
+            )
+            after = self._evaluate_definition(flag_key, new_revision, candidate, context)
+            if before["enabled"] != after["enabled"]:
+                try:
+                    impacted.add(context.get("subject_id"))
+                except TypeError:
+                    raise InvalidRolloutChangeError("subject_id 必须可哈希")
+
+        if impacted != expected_set:
+            raise RolloutConflictError(
+                "flag_key=%r 推进阶段 %r 到 percentage=%r 的实际影响面 %r 与预期 %r 不一致"
+                % (flag_key, stage["name"], stage["percentage"],
+                   sorted(impacted, key=str), sorted(expected_set, key=str)),
+                sorted(impacted, key=str),
+            )
+
+        state.revisions[new_revision] = candidate
+        state.current = new_revision
+        plan.confirmed_revision = new_revision
+        plan.cursor += 1
+        completed = plan.completed
+        remaining = len(plan.stages) - plan.cursor
+        return {
+            "revision": new_revision,
+            "stage": copy.deepcopy(stage),
+            "impacted": sorted(impacted, key=str),
+            "completed": completed,
+            "remaining": remaining,
+        }
+
+    @staticmethod
+    def _is_finite_number(value: Any) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        )
 
     # ------------------------------------------------------------------
     # preview_change：只读灰度预演（不改变任何线上状态）

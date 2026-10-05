@@ -40,6 +40,18 @@ class RolloutConflictError(FlagRolloutError):
     """渐进放量晋升的实际影响面与预期不一致，不创建候选版本，当前版本保持不变。"""
 
 
+class InvalidRolloutPlanError(FlagRolloutError):
+    """多阶段放量计划的阶段输入非法（stages 为空、name 缺失/重复、percentage 非法或未严格递增等）。"""
+
+
+class RolloutPlanConflictError(FlagRolloutError):
+    """同一 flag_key 已存在未完成的放量计划，不能重复登记。"""
+
+
+class RolloutPlanStateError(FlagRolloutError):
+    """放量计划推进时状态不合法：无计划、计划已完成，或当前 revision 偏离最近确认值。"""
+
+
 # 预演（preview_change）的确定性错误码：HTTP 适配层统一映射为 422。
 PREVIEW_ERROR_INVALID_PAYLOAD = "invalid_payload"
 PREVIEW_ERROR_FLAG_KEY_EMPTY = "flag_key_empty"

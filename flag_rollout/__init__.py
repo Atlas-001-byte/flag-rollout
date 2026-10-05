@@ -21,12 +21,15 @@ from .errors import (
     FlagRolloutError,
     InvalidDefinitionError,
     InvalidRolloutChangeError,
+    InvalidRolloutPlanError,
     MissingSubjectError,
     PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
     RolloutConflictError,
+    RolloutPlanConflictError,
+    RolloutPlanStateError,
 )
 from .service import FeatureFlagService
 
@@ -41,6 +44,9 @@ __all__ = [
     "RollbackConflictError",
     "InvalidRolloutChangeError",
     "RolloutConflictError",
+    "InvalidRolloutPlanError",
+    "RolloutPlanConflictError",
+    "RolloutPlanStateError",
     "PreviewValidationError",
     "PREVIEW_ERROR_INVALID_PAYLOAD",
     "PREVIEW_ERROR_FLAG_KEY_EMPTY",
@@ -57,6 +63,5 @@ __all__ = [
     "PREVIEW_ERROR_STAGE_PERCENTAGE_INVALID",
     "PREVIEW_ERROR_STAGE_PERCENTAGE_ORDER",
     "PREVIEW_ERROR_STAGE_OVERLAP",
-    "PREVIEW_ERROR_CANDIDATE_INVALID",
     "PREVIEW_ERROR_CANDIDATE_EVALUATION",
 ]

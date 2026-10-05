@@ -18,6 +18,9 @@
 - `RollbackConflictError`：回滚实际影响面与预期不一致，当前版本不变。
 - `InvalidRolloutChangeError`：promote_rollout 参数无效（percentage 类型/范围、subjects/expected_impacted 不可迭代或成员不可哈希）。
 - `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
+- `InvalidRolloutPlanError`：多阶段放量计划的阶段输入非法（stages 为空/不可迭代、name 缺失或重复、percentage 非有限数或未严格递增等）。
+- `RolloutPlanConflictError`：同一 flag_key 已存在未完成的放量计划。
+- `RolloutPlanStateError`：计划推进时无计划、计划已完成，或当前 revision 偏离最近确认值。
 - `PreviewValidationError`：预演请求不合法（对应 HTTP 422），携带唯一确定的 `error_code` 与 `details`。
 
 ## 用法
@@ -61,6 +64,49 @@ svc.promote_rollout("new-checkout", 50,
 ```
 
 指定 `revision` 的求值结果固定；已发布版本不可修改。
+
+## 多阶段放量计划（create_rollout_plan / advance_rollout_plan）
+
+在 `promote_rollout` 的单次放量之上，提供登记—逐阶段确认的多阶段放量。计划
+仅存内存：无网络、无持久化、无定时器、无重启恢复；不登记计划时既有入口行为
+完全不变。
+
+```python
+# 登记计划：stages 非空；每项 name 为非空且唯一的字符串，percentage 为非布尔
+# 有限数，相对当前 rollout.percentage 严格递增、且不超过 100。登记不改
+# revision、不预建版本。
+svc.create_rollout_plan("new-checkout", [
+    {"name": "canary", "percentage": 10},
+    {"name": "beta", "percentage": 50},
+    {"name": "full", "percentage": 100},
+])
+# -> {"flagKey": "new-checkout", "baseRevision": 1, "basePercentage": 0,
+#     "stages": [{"name": "canary", "percentage": 10, "index": 0}, ...]}
+
+# 推进下一阶段：基准 definition 只改 rollout.percentage，按 promote_rollout 的
+# 规则命中 → enabled → 放量桶顺序求值。影响为 enabled 发生改变的 subject_id
+# （去重、按字符串排序）；与 expected_impacted 相同才创建并激活“下一未用正整数
+# revision”（已有最大 revision + 1）。
+svc.advance_rollout_plan("new-checkout",
+                         subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}],
+                         expected_impacted={"u-2"})
+# -> {"revision": 2, "stage": {"name": "canary", "percentage": 10, "index": 0},
+#     "impacted": ["u-2"], "completed": False, "remaining": 2}
+```
+
+- 每推进一阶段消耗一个阶段；最后一个阶段推进成功后 `completed=True`、
+  `remaining=0`，计划完成。完成后同一 flag 可登记新计划（阶段仍须严格高于
+  当前 `rollout.percentage`）；存在未完成计划时重复登记抛
+  `RolloutPlanConflictError`，原计划不变。
+- 计划记录“最近确认值”：登记时为基准 revision，每次推进后更新为新建 revision。
+  推进时若无计划、计划已完成，或当前 revision 因 rollback / publish /
+  promote_rollout 等偏离最近确认值，抛 `RolloutPlanStateError`。
+- 影响面不一致抛 `RolloutConflictError`（参数携带排序后的实际影响列表），
+  不建版本、不推进，可用正确的 `expected_impacted` 重试同一阶段。
+- 阶段输入非法抛 `InvalidRolloutPlanError`；`subjects` / `expected_impacted`
+  不可迭代或成员不可哈希抛 `InvalidRolloutChangeError`；放量缺非空
+  `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
+  以上错误均不改版本或计划。
 
 ## 预演（preview_change）
 
