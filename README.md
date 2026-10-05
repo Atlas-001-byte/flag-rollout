@@ -20,7 +20,8 @@
 - `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
 - `InvalidRolloutPlanError`：多阶段放量计划的阶段输入非法（stages 为空/不可迭代、name 缺失或重复、percentage 非有限数或未严格递增等）。
 - `RolloutPlanConflictError`：同一 flag_key 已存在未完成的放量计划。
-- `RolloutPlanStateError`：计划推进时无计划、计划已完成，或当前 revision 偏离最近确认值。
+- `RolloutPlanStateError`：计划推进或取消时无计划、计划已完成，或当前 revision 偏离最近确认值。
+- `RolloutCancelConflictError`：取消计划的实际影响面与预期不一致（携带排序后的实际影响列表），计划与当前版本不变。
 - `PreviewValidationError`：预演请求不合法（对应 HTTP 422），携带唯一确定的 `error_code` 与 `details`。
 
 ## 用法
@@ -92,6 +93,16 @@ svc.advance_rollout_plan("new-checkout",
                          expected_impacted={"u-2"})
 # -> {"revision": 2, "stage": {"name": "canary", "percentage": 10, "index": 0},
 #     "impacted": ["u-2"], "completed": False, "remaining": 2}
+
+# 取消未完成计划：比较各主体在当前 revision 与基准 revision 下的求值结果，
+# enabled 变化的 subject_id（去重、按字符串排序）构成实际影响面；与
+# expected_impacted 完全一致才把当前 revision 恢复为 baseRevision 并删除计划，
+# flag_key 可立即登记新计划。推进产生的历史 revision 不删除，仍可按 revision 求值。
+svc.cancel_rollout_plan("new-checkout",
+                        subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}],
+                        expected_impacted={"u-2"})
+# -> {"flagKey": "new-checkout", "restoredRevision": 1,
+#     "cancelledStage": "canary", "impacted": ["u-2"]}
 ```
 
 - 每推进一阶段消耗一个阶段；最后一个阶段推进成功后 `completed=True`、
@@ -103,6 +114,11 @@ svc.advance_rollout_plan("new-checkout",
   promote_rollout 等偏离最近确认值，抛 `RolloutPlanStateError`。
 - 影响面不一致抛 `RolloutConflictError`（参数携带排序后的实际影响列表），
   不建版本、不推进，可用正确的 `expected_impacted` 重试同一阶段。
+- 取消要求计划未完成且当前 revision 等于最近确认值，否则抛
+  `RolloutPlanStateError`；影响面不符抛 `RolloutCancelConflictError`
+  （`impacted` 为排序后的实际影响列表），不建版本、不改当前 revision、
+  不删计划。返回的 `cancelledStage` 取最近确认阶段的 name，未推进时为
+  `None`。
 - 阶段输入非法抛 `InvalidRolloutPlanError`；`subjects` / `expected_impacted`
   不可迭代或成员不可哈希抛 `InvalidRolloutChangeError`；放量缺非空
   `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。

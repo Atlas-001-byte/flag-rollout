@@ -52,6 +52,18 @@ class RolloutPlanStateError(FlagRolloutError):
     """放量计划推进时状态不合法：无计划、计划已完成，或当前 revision 偏离最近确认值。"""
 
 
+class RolloutCancelConflictError(FlagRolloutError):
+    """取消放量计划的实际影响面与预期不一致，计划与当前版本保持不变。
+
+    ``impacted`` 为实际影响面（enabled 发生变化的 subject_id，去重后按字符串
+    排序）；同时作为第二个位置参数保留，与 RolloutConflictError 的携带方式一致。
+    """
+
+    def __init__(self, message: str, impacted: Any = None) -> None:
+        super().__init__(message, impacted)
+        self.impacted = impacted
+
+
 # 预演（preview_change）的确定性错误码：HTTP 适配层统一映射为 422。
 PREVIEW_ERROR_INVALID_PAYLOAD = "invalid_payload"
 PREVIEW_ERROR_FLAG_KEY_EMPTY = "flag_key_empty"

@@ -36,6 +36,7 @@ from .errors import (
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
+    RolloutCancelConflictError,
     RolloutConflictError,
     RolloutPlanConflictError,
     RolloutPlanStateError,
@@ -98,6 +99,7 @@ class FeatureFlagService:
     - evaluate：按规则 → enabled → 放量桶的顺序求值。
     - rollback：校验影响面后把当前版本切回目标 revision。
     - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
+    - cancel_rollout_plan：取消未完成计划，把当前 revision 恢复为基准 revision。
     """
 
     def __init__(self) -> None:
@@ -266,7 +268,8 @@ class FeatureFlagService:
         return {"revision": new_revision, "impacted": sorted(impacted, key=str)}
 
     # ------------------------------------------------------------------
-    # create_rollout_plan / advance_rollout_plan：多阶段放量计划（仅存内存）
+    # create_rollout_plan / advance_rollout_plan / cancel_rollout_plan：
+    # 多阶段放量计划（仅存内存）
     # ------------------------------------------------------------------
     def create_rollout_plan(
         self,
@@ -427,6 +430,94 @@ class FeatureFlagService:
             "impacted": sorted(impacted, key=str),
             "completed": completed,
             "remaining": remaining,
+        }
+
+    def cancel_rollout_plan(
+        self,
+        flag_key: str,
+        subjects: Iterable[Mapping[str, Any]],
+        expected_impacted: Iterable[Any],
+    ) -> Dict[str, Any]:
+        """取消未完成的放量计划：确认影响面后把当前 revision 恢复为基准 revision。
+
+        逐个比较受检主体在当前 revision 与计划基准 revision（base_revision）下
+        的求值结果（规则 → enabled → 放量桶，与既有口径一致），enabled 发生变化
+        的 subject_id 去重、按字符串排序构成实际影响面；与 expected_impacted
+        完全一致才把当前 revision 恢复为 base_revision 并删除计划，此后
+        flag_key 可立即登记新计划。推进产生的历史 revision 不删除，仍可由
+        evaluate 按 revision 求值。
+
+        无未完成计划或当前 revision 偏离最近确认值抛 RolloutPlanStateError；
+        subjects/expected_impacted 不可迭代、上下文非 Mapping、subject_id 或
+        expected_impacted 成员不可哈希抛 InvalidRolloutChangeError；放量缺非空
+        subject_id 抛 MissingSubjectError；未知 flag 抛 FlagNotFoundError；
+        影响面不符抛 RolloutCancelConflictError（携带排序后的实际影响面）。
+        以上错误均不创建 revision，也不改当前 revision、cursor、
+        confirmed_revision 与计划。
+
+        返回 {"flagKey", "restoredRevision", "cancelledStage", "impacted"}；
+        cancelledStage 为最近确认阶段的 name，计划未推进时为 None。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        plan = self._plans.get(flag_key)
+        if (
+            plan is None
+            or plan.completed
+            or state.current != plan.confirmed_revision
+        ):
+            raise RolloutPlanStateError(
+                "flag_key=%r 没有可取消的放量计划（无计划、已完成或当前 revision "
+                "已偏离最近确认值）" % (flag_key,)
+            )
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+        try:
+            expected_set = set(expected_impacted)
+        except TypeError:
+            raise InvalidRolloutChangeError("expected_impacted 必须可迭代且成员可哈希")
+
+        current_revision = state.current
+        base_revision = plan.base_revision
+        impacted: Set[Any] = set()
+        for context in subject_list:
+            if not isinstance(context, Mapping):
+                raise InvalidRolloutChangeError("subjects 的每项必须是 Mapping")
+            before = self._evaluate_definition(
+                flag_key, current_revision, state.revisions[current_revision], context
+            )
+            after = self._evaluate_definition(
+                flag_key, base_revision, state.revisions[base_revision], context
+            )
+            if before["enabled"] != after["enabled"]:
+                try:
+                    impacted.add(context.get("subject_id"))
+                except TypeError:
+                    raise InvalidRolloutChangeError("subject_id 必须可哈希")
+
+        if impacted != expected_set:
+            raise RolloutCancelConflictError(
+                "flag_key=%r 取消放量计划的实际影响面 %r 与预期 %r 不一致"
+                % (flag_key,
+                   sorted(impacted, key=str), sorted(expected_set, key=str)),
+                sorted(impacted, key=str),
+            )
+
+        cancelled_stage = (
+            plan.stages[plan.cursor - 1]["name"] if plan.cursor > 0 else None
+        )
+        state.current = base_revision
+        del self._plans[flag_key]
+        return {
+            "flagKey": flag_key,
+            "restoredRevision": base_revision,
+            "cancelledStage": cancelled_stage,
+            "impacted": sorted(impacted, key=str),
         }
 
     @staticmethod
