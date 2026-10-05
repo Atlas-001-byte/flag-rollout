@@ -21,12 +21,15 @@ from .errors import (
     FlagRolloutError,
     InvalidDefinitionError,
     InvalidRolloutChangeError,
+    InvalidRolloutPlanError,
     MissingSubjectError,
     PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
     RollbackConflictError,
     RolloutConflictError,
+    RolloutPlanConflictError,
+    RolloutPlanStateError,
 )
 from .service import FeatureFlagService
 
@@ -41,6 +44,9 @@ __all__ = [
     "RollbackConflictError",
     "InvalidRolloutChangeError",
     "RolloutConflictError",
+    "InvalidRolloutPlanError",
+    "RolloutPlanConflictError",
+    "RolloutPlanStateError",
     "PreviewValidationError",
     "PREVIEW_ERROR_INVALID_PAYLOAD",
     "PREVIEW_ERROR_FLAG_KEY_EMPTY",
