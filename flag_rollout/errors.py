@@ -49,7 +49,14 @@ class RolloutPlanConflictError(FlagRolloutError):
 
 
 class RolloutPlanStateError(FlagRolloutError):
-    """放量计划推进时状态不合法：无计划、计划已完成，或当前 revision 偏离最近确认值。"""
+    """放量计划推进或取消时状态不合法：无计划、计划已完成，或当前 revision 偏离最近确认值。"""
+
+
+class RolloutCancelConflictError(FlagRolloutError):
+    """取消放量计划的实际影响面与预期不一致，当前版本与计划均保持不变。
+
+    第二个参数（``args[1]``）携带按字符串排序后的实际影响主体列表。
+    """
 
 
 # 预演（preview_change）的确定性错误码：HTTP 适配层统一映射为 422。

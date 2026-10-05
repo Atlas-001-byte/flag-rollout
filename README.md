@@ -20,7 +20,8 @@
 - `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
 - `InvalidRolloutPlanError`：多阶段放量计划的阶段输入非法（stages 为空/不可迭代、name 缺失或重复、percentage 非有限数或未严格递增等）。
 - `RolloutPlanConflictError`：同一 flag_key 已存在未完成的放量计划。
-- `RolloutPlanStateError`：计划推进时无计划、计划已完成，或当前 revision 偏离最近确认值。
+- `RolloutPlanStateError`：计划推进或取消时无计划、计划已完成，或当前 revision 偏离最近确认值。
+- `RolloutCancelConflictError`：取消未完成计划时实际影响面与预期不一致，当前版本与计划均保持不变（参数携带排序后的实际影响列表）。
 - `PreviewValidationError`：预演请求不合法（对应 HTTP 422），携带唯一确定的 `error_code` 与 `details`。
 
 ## 用法
@@ -107,6 +108,41 @@ svc.advance_rollout_plan("new-checkout",
   不可迭代或成员不可哈希抛 `InvalidRolloutChangeError`；放量缺非空
   `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
   以上错误均不改版本或计划。
+
+### 取消未完成计划（cancel_rollout_plan）
+
+`cancel_rollout_plan(flag_key, subjects, expected_impacted)` 取消尚未完成的
+放量计划，避免错误计划长期占用 `flag_key`。取消仅改内存中的当前 revision 与
+活动计划：不创建 revision、不引入网络、持久化、定时器、重启恢复或并发控制。
+
+- 前置条件：存在未完成计划，且当前 revision 等于计划的最近确认值；否则抛
+  `RolloutPlanStateError`（无计划、计划已完成、或 revision 因 rollback /
+  publish / promote_rollout 偏离）。
+- `subjects` 按规则 → enabled → 放量桶顺序，分别在当前 revision 与
+  `base_revision` 下求值；`enabled` 发生变化的 `subject_id` 去重、按字符串
+  排序构成实际影响面，必须与 `expected_impacted` **完全相等**才成功。
+- 成功后当前 revision 回到 `base_revision` 并删除计划，`flag_key` 可立即
+  登记新计划；推进产生的历史 revision 仍保留，可由 `evaluate(revision=...)`
+  按 revision 求值。
+- 返回：
+
+```python
+svc.cancel_rollout_plan("new-checkout",
+                        subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}],
+                        expected_impacted={"u-2"})
+# -> {"flagKey": "new-checkout", "restoredRevision": 1,
+#     "cancelledStage": "canary",  # 最近确认阶段 name；尚未推进时为 None
+#     "impacted": ["u-2"]}
+```
+
+- 影响面不符抛 `RolloutCancelConflictError`（参数携带排序后的实际影响列表），
+  当前 revision、cursor、confirmed_revision 与计划均不变，可用正确的
+  `expected_impacted` 重试。
+- `subjects` / `expected_impacted` 不可迭代、上下文非 Mapping，或
+  `subject_id` / `expected_impacted` 成员不可哈希抛
+  `InvalidRolloutChangeError`；放量缺非空 `subject_id` 抛
+  `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。任何异常都不创建
+  revision，也不改当前 revision、cursor、confirmed_revision 与计划。
 
 ## 预演（preview_change）
 
