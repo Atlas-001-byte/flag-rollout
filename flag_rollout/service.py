@@ -99,6 +99,7 @@ class FeatureFlagService:
     - evaluate：按规则 → enabled → 放量桶的顺序求值。
     - rollback：校验影响面后把当前版本切回目标 revision。
     - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
+    - forecast_rollout_plan：只读预演剩余阶段的影响面，不创建 revision、不推进。
     - cancel_rollout_plan：取消未完成计划，把当前 revision 恢复为基准 revision。
     """
 
@@ -518,6 +519,113 @@ class FeatureFlagService:
             "restoredRevision": base_revision,
             "cancelledStage": cancelled_stage,
             "impacted": sorted(impacted, key=str),
+        }
+
+    # ------------------------------------------------------------------
+    # forecast_rollout_plan：只读预演剩余阶段影响面（不创建 revision）
+    # ------------------------------------------------------------------
+    def forecast_rollout_plan(
+        self,
+        flag_key: str,
+        subjects: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """只读预演：连续推进计划剩余阶段时各阶段的影响面与将使用的版本号。
+
+        取游标之后的剩余阶段，以最近确认 revision 的 definition 为底稿（该
+        revision 即当前 revision，状态校验已保证二者相同），仅替换
+        rollout.percentage，规则、enabled、放量桶（salt/serve）与顺序全部沿用
+        advance_rollout_plan 的口径。首阶段对比当前 revision，后续阶段对比上一
+        模拟阶段；enabled 发生变化的 subject_id 去重、按字符串排序得到该阶段
+        impacted。cumulativeImpacted 为相对当前 revision 到该阶段为止的累计变化；
+        totalImpacted 为全部剩余阶段变化的并集，二者同样去重、按字符串排序。
+
+        forecast_revision 是连续推进将使用的版本号：下一未用正整数 revision
+        （已有最大 revision + 1）起，各剩余阶段依次连续递增。
+
+        纯只读：不创建 revision，不改 current、cursor、confirmed_revision 与
+        计划；相同状态与 subjects 重复调用结果一致。无计划、计划已完成或当前
+        revision 偏离最近确认值抛 RolloutPlanStateError；subjects 不可迭代、
+        上下文不是 Mapping 或 subject_id 不可哈希抛 InvalidRolloutChangeError；
+        进入放量判断但缺少非空 subject_id 抛 MissingSubjectError；未知 flag
+        抛 FlagNotFoundError。以上异常均保持状态不变。
+
+        返回 {"flagKey", "baseRevision", "currentRevision", "stages",
+        "totalImpacted"}；stages 与剩余阶段同序，每项含 name、percentage、index、
+        forecast_revision、impacted、cumulativeImpacted。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        plan = self._plans.get(flag_key)
+        if (
+            plan is None
+            or plan.completed
+            or state.current != plan.confirmed_revision
+        ):
+            raise RolloutPlanStateError(
+                "flag_key=%r 没有可预演的放量计划（无计划、已完成或当前 revision "
+                "已偏离最近确认值）" % (flag_key,)
+            )
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+
+        current_revision = state.current
+        base_definition = state.revisions[plan.confirmed_revision]
+        first_new_revision = max(state.revisions) + 1
+
+        stage_results: List[Dict[str, Any]] = []
+        # 每阶段 impacted 对比上一模拟阶段；累计/总影响为各阶段变化的并集。
+        # 各模拟阶段仅严格递增 rollout.percentage，规则、enabled 与桶边界不变，
+        # 同一 subject_id 至多翻转一次，故并集即“相对当前 revision 的累计变化”。
+        cumulative: Set[Any] = set()
+        previous_definition = state.revisions[current_revision]
+        previous_revision = current_revision
+
+        for offset, stage in enumerate(plan.stages[plan.cursor:]):
+            candidate = copy.deepcopy(base_definition)
+            candidate["rollout"]["percentage"] = stage["percentage"]
+            forecast_revision = first_new_revision + offset
+
+            impacted: Set[Any] = set()
+            for context in subject_list:
+                if not isinstance(context, Mapping):
+                    raise InvalidRolloutChangeError("subjects 的每项必须是 Mapping")
+                before = self._evaluate_definition(
+                    flag_key, previous_revision, previous_definition, context
+                )
+                after = self._evaluate_definition(
+                    flag_key, forecast_revision, candidate, context
+                )
+                if before["enabled"] != after["enabled"]:
+                    try:
+                        impacted.add(context.get("subject_id"))
+                    except TypeError:
+                        raise InvalidRolloutChangeError("subject_id 必须可哈希")
+
+            cumulative |= impacted
+            stage_results.append(
+                {
+                    "name": stage["name"],
+                    "percentage": stage["percentage"],
+                    "index": stage["index"],
+                    "forecast_revision": forecast_revision,
+                    "impacted": sorted(impacted, key=str),
+                    "cumulativeImpacted": sorted(cumulative, key=str),
+                }
+            )
+            previous_definition = candidate
+            previous_revision = forecast_revision
+
+        return {
+            "flagKey": flag_key,
+            "baseRevision": plan.base_revision,
+            "currentRevision": current_revision,
+            "stages": stage_results,
+            "totalImpacted": sorted(cumulative, key=str),
         }
 
     @staticmethod

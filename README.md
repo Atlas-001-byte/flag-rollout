@@ -124,6 +124,61 @@ svc.cancel_rollout_plan("new-checkout",
   `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
   以上错误均不改版本或计划。
 
+## 只读影响面预演（forecast_rollout_plan）
+
+`forecast_rollout_plan(flag_key, subjects)` 是在 `advance_rollout_plan` 之前查看
+可推进计划**剩余阶段**影响面的只读入口。它不替代 `preview_change`（后者预演候选
+配置与候选阶段，使用独立 salt 环；本入口完全沿用计划与当前已发布定义的口径），也
+不改变任何既有入口；不创建 revision、不预建版本，不改当前 revision、cursor、
+confirmed_revision 与计划，无网络、无持久化、无定时器、无重启恢复，相同状态与
+subjects 重复调用结果一致。
+
+取游标之后的剩余阶段（计划完成后无剩余阶段，调用抛 `RolloutPlanStateError`），以
+**最近确认 revision**（即当前 revision；偏离时同样抛 `RolloutPlanStateError`）的
+definition 为底稿，仅替换每个阶段的 `rollout.percentage`；规则、`enabled`、放量桶
+（salt/serve）与阶段顺序全部沿用 `advance_rollout_plan` 的求值口径。首阶段对比当前
+revision，后续阶段对比上一模拟阶段；enabled 变化的 subject_id 去重、按字符串排序
+得到该阶段 `impacted`。`cumulativeImpacted` 是相对当前 revision 到该阶段为止的
+累计变化；`totalImpacted` 是全部剩余阶段变化的并集，均去重、按字符串排序。
+
+`forecast_revision` 是**连续推进将使用的第一版本号及后续连续版本号**：从“下一未用
+正整数 revision”（已有最大 revision + 1）起，按剩余阶段同序连续递增。
+
+```python
+# 接上面的 3 阶段计划（canary=10, beta=50, full=100），尚未推进，当前 revision=1。
+svc.forecast_rollout_plan(
+    "new-checkout",
+    subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}],
+)
+# -> {
+#     "flagKey": "new-checkout",
+#     "baseRevision": 1,
+#     "currentRevision": 1,
+#     "stages": [
+#       {"name": "canary", "percentage": 10, "index": 0,
+#        "forecast_revision": 2, "impacted": [...], "cumulativeImpacted": [...]},
+#       {"name": "beta", "percentage": 50, "index": 1,
+#        "forecast_revision": 3, "impacted": [...], "cumulativeImpacted": [...]},
+#       {"name": "full",   "percentage": 100, "index": 2,
+#        "forecast_revision": 4, "impacted": [...], "cumulativeImpacted": [...]},
+#     ],
+#     "totalImpacted": [...],
+# }
+```
+
+- `stages` 与剩余阶段同序，每项含 `name`、`percentage`、`index`、
+  `forecast_revision`、`impacted`、`cumulativeImpacted`；`index` 为该阶段在原计划
+  中的 0 基序号（即已推进阶段会被跳过，首个返回项的 `index` 不一定为 0）。
+- 各模拟阶段只改百分比，桶边界不变且比例严格递增，同一 subject_id 在剩余阶段内
+  至多翻转一次；因此 `cumulativeImpacted` 等于到该阶段为止各阶段 `impacted` 的
+  并集，最后一个阶段的 `cumulativeImpacted` 即 `totalImpacted`。
+- 错误语义与 `advance_rollout_plan` 一致（本入口无 `expected_impacted` 参数）：
+  未知 `flag_key` 抛 `FlagNotFoundError`；无未完成计划、已完成或当前 revision 不
+  等于最近确认值抛 `RolloutPlanStateError`；`subjects` 不可迭代、上下文不是
+  Mapping 或 `subject_id` 不可哈希抛 `InvalidRolloutChangeError`；进入放量判断但
+  缺少非空 `subject_id` 抛 `MissingSubjectError`。所有异常均保持状态不变，可直接
+  用相同参数重试。
+
 ## 预演（preview_change）
 
 `preview_change(request)` 是独立的只读公开入口，用来在真正提交配置前，看清同一批
