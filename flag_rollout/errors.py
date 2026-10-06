@@ -68,6 +68,19 @@ class RolloutCancelConflictError(FlagRolloutError):
         self.impacted = impacted
 
 
+class RolloutStageConflictError(FlagRolloutError):
+    """回退最近确认阶段的实际影响面与预期不一致，当前版本与计划保持不变。
+
+    ``impacted`` 为实际影响面（主功能 enabled 发生变化的 subject_id，去重后按
+    字符串排序）；同时作为第二个位置参数保留，与 RolloutConflictError 的携带
+    方式一致。
+    """
+
+    def __init__(self, message: str, impacted: Any = None) -> None:
+        super().__init__(message, impacted)
+        self.impacted = impacted
+
+
 # 预演（preview_change）的确定性错误码：HTTP 适配层统一映射为 422。
 PREVIEW_ERROR_INVALID_PAYLOAD = "invalid_payload"
 PREVIEW_ERROR_FLAG_KEY_EMPTY = "flag_key_empty"

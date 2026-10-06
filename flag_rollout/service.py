@@ -41,6 +41,7 @@ from .errors import (
     RolloutConflictError,
     RolloutPlanConflictError,
     RolloutPlanStateError,
+    RolloutStageConflictError,
 )
 
 OPERATORS = ("equals", "in", "greater_than")
@@ -73,9 +74,19 @@ class _RolloutPlan:
     - confirmed_revision：最近一次推进确认的当前 revision；登记时为基准
       revision，每次推进后更新为新创建的 revision。下次推进时当前 revision
       偏离该值即视为状态失效。
+    - confirmed_revisions：每次推进确认产生的 revision，按推进顺序记录；
+      rollback_stage 据此确定回退目标（首阶段前为 base_revision，之后为上一
+      次推进的结果）。回退一阶段弹出末项。
     """
 
-    __slots__ = ("base_revision", "base_percentage", "stages", "cursor", "confirmed_revision")
+    __slots__ = (
+        "base_revision",
+        "base_percentage",
+        "stages",
+        "cursor",
+        "confirmed_revision",
+        "confirmed_revisions",
+    )
 
     def __init__(
         self,
@@ -88,6 +99,7 @@ class _RolloutPlan:
         self.stages = stages
         self.cursor = 0
         self.confirmed_revision = base_revision
+        self.confirmed_revisions: List[int] = []
 
     @property
     def completed(self) -> bool:
@@ -101,6 +113,7 @@ class FeatureFlagService:
     - evaluate：按规则 → enabled → 放量桶的顺序求值。
     - rollback：校验影响面后把当前版本切回目标 revision。
     - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
+    - rollback_stage：确认影响面后回退最近确认的放量阶段。
     - forecast_rollout_plan：只读预演剩余阶段的影响面，不创建 revision、不推进。
     - cancel_rollout_plan：取消未完成计划，把当前 revision 恢复为基准 revision。
     """
@@ -424,6 +437,7 @@ class FeatureFlagService:
         state.revisions[new_revision] = candidate
         state.current = new_revision
         plan.confirmed_revision = new_revision
+        plan.confirmed_revisions.append(new_revision)
         plan.cursor += 1
         completed = plan.completed
         remaining = len(plan.stages) - plan.cursor
@@ -433,6 +447,112 @@ class FeatureFlagService:
             "impacted": sorted(impacted, key=str),
             "completed": completed,
             "remaining": remaining,
+        }
+
+    def rollback_stage(
+        self,
+        flag_key: str,
+        subjects: Iterable[Mapping[str, Any]],
+        expected_impacted: Iterable[Any],
+    ) -> Dict[str, Any]:
+        """回退最近确认阶段：确认影响面后把当前 revision 恢复为推进该阶段前版本。
+
+        仅处理存在计划、cursor 大于 0 且当前 revision 等于 confirmedRevision
+        的计划。回退目标 revision 为上一次 advance_rollout_plan 成功前的版本：
+        回退首阶段时为 baseRevision，回退后续阶段时为上一次推进的结果 revision。
+        逐个比较受检主体在当前 revision 与目标 revision 下的求值结果（规则 →
+        enabled → 放量桶，与既有口径一致，前置依赖同样经门控），主功能 enabled
+        发生翻转的 subject_id 去重、按字符串排序构成实际影响面；与
+        expected_impacted 完全一致才提交。
+
+        提交时恢复当前 revision 为目标 revision，cursor 减一，confirmedRevision
+        更新为目标 revision；推进产生的历史 revision 与后续阶段定义全部保留。
+        回退末阶段（计划完成后的唯一已确认阶段）后 completed=False，计划重新
+        可推进。此后再调 advance_rollout_plan 即推进被回退的阶段，并分配下一
+        个未用正整数 revision（已有最大 revision + 1，不重用回退腾出的号）。
+
+        无计划、cursor 为 0 或当前 revision 偏离最近确认值抛
+        RolloutPlanStateError；影响面不符抛 RolloutStageConflictError（携带排序
+        后的实际影响面）；subjects/expected_impacted 不可迭代、上下文非
+        Mapping、subject_id 或 expected_impacted 成员不可哈希抛
+        InvalidRolloutChangeError；放量缺非空 subject_id 抛 MissingSubjectError；
+        依赖版本缺失、依赖主体缺失、依赖成环分别抛 RevisionNotFoundError、
+        MissingSubjectError、PrerequisiteCycleError；未知 flag 抛
+        FlagNotFoundError。以上错误均不改当前 revision、cursor、
+        confirmedRevision 与计划，可用相同输入重试。
+
+        返回 {"flagKey", "rolledBackStage", "restoredRevision", "impacted",
+        "cursor", "completed", "remaining"}；rolledBackStage 为被回退阶段的
+        name、percentage、index；remaining 为回退后 cursor 之后尚未确认的
+        阶段数。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        plan = self._plans.get(flag_key)
+        if (
+            plan is None
+            or plan.cursor <= 0
+            or state.current != plan.confirmed_revision
+        ):
+            raise RolloutPlanStateError(
+                "flag_key=%r 没有可回退的放量阶段（无计划、尚无确认阶段或当前 "
+                "revision 已偏离最近确认值）" % (flag_key,)
+            )
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+        try:
+            expected_set = set(expected_impacted)
+        except TypeError:
+            raise InvalidRolloutChangeError("expected_impacted 必须可迭代且成员可哈希")
+
+        current_revision = state.current
+        rolled_back_stage = copy.deepcopy(plan.stages[plan.cursor - 1])
+        if plan.cursor <= 1:
+            target_revision = plan.base_revision
+        else:
+            target_revision = plan.confirmed_revisions[plan.cursor - 2]
+
+        impacted: Set[Any] = set()
+        for context in subject_list:
+            if not isinstance(context, Mapping):
+                raise InvalidRolloutChangeError("subjects 的每项必须是 Mapping")
+            before = self._evaluate_definition(
+                flag_key, current_revision, state.revisions[current_revision], context
+            )
+            after = self._evaluate_definition(
+                flag_key, target_revision, state.revisions[target_revision], context
+            )
+            if before["enabled"] != after["enabled"]:
+                try:
+                    impacted.add(context.get("subject_id"))
+                except TypeError:
+                    raise InvalidRolloutChangeError("subject_id 必须可哈希")
+
+        if impacted != expected_set:
+            raise RolloutStageConflictError(
+                "flag_key=%r 回退阶段 %r 到 revision=%r 的实际影响面 %r 与预期 %r 不一致"
+                % (flag_key, rolled_back_stage["name"], target_revision,
+                   sorted(impacted, key=str), sorted(expected_set, key=str)),
+                sorted(impacted, key=str),
+            )
+
+        state.current = target_revision
+        plan.confirmed_revisions.pop()
+        plan.cursor -= 1
+        plan.confirmed_revision = target_revision
+        return {
+            "flagKey": flag_key,
+            "rolledBackStage": rolled_back_stage,
+            "restoredRevision": target_revision,
+            "impacted": sorted(impacted, key=str),
+            "cursor": plan.cursor,
+            "completed": plan.completed,
+            "remaining": len(plan.stages) - plan.cursor,
         }
 
     def cancel_rollout_plan(

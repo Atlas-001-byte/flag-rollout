@@ -32,6 +32,7 @@ from .errors import (
     RolloutConflictError,
     RolloutPlanConflictError,
     RolloutPlanStateError,
+    RolloutStageConflictError,
 )
 from .service import FeatureFlagService
 
@@ -50,6 +51,7 @@ __all__ = [
     "InvalidRolloutPlanError",
     "RolloutPlanConflictError",
     "RolloutPlanStateError",
+    "RolloutStageConflictError",
     "RolloutCancelConflictError",
     "PreviewValidationError",
     "PREVIEW_ERROR_INVALID_PAYLOAD",

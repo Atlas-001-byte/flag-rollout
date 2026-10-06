@@ -23,6 +23,7 @@
 - `RolloutPlanConflictError`：同一 flag_key 已存在未完成的放量计划。
 - `RolloutPlanStateError`：计划推进或取消时无计划、计划已完成，或当前 revision 偏离最近确认值。
 - `RolloutCancelConflictError`：取消计划的实际影响面与预期不一致（携带排序后的实际影响列表），计划与当前版本不变。
+- `RolloutStageConflictError`：回退最近确认阶段的实际影响面与预期不一致（携带排序后的实际影响列表），当前版本与计划不变。
 - `PreviewValidationError`：预演请求不合法（对应 HTTP 422），携带唯一确定的 `error_code` 与 `details`。
 
 ## 用法
@@ -167,6 +168,20 @@ svc.cancel_rollout_plan("new-checkout",
                         expected_impacted={"u-2"})
 # -> {"flagKey": "new-checkout", "restoredRevision": 1,
 #     "cancelledStage": "canary", "impacted": ["u-2"]}
+
+# 若不取消整个计划，也可只回退最近确认阶段（接上：canary 推进成功后、取消前
+# 的状态，当前 revision=2）。比较各主体在当前 revision 与推进该阶段前版本
+# （首阶段前即 baseRevision=1）下的求值结果，enabled 翻转的 subject_id 去重、
+# 按字符串排序；与 expected_impacted 一致才把当前 revision 恢复为推进前版本，
+# cursor 减一、confirmedRevision 同步回退；历史 revision（canary 的 revision=2）
+# 与后续阶段定义保留，计划可再次推进。
+svc.rollback_stage("new-checkout",
+                   subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}],
+                   expected_impacted={"u-2"})
+# -> {"flagKey": "new-checkout",
+#     "rolledBackStage": {"name": "canary", "percentage": 10, "index": 0},
+#     "restoredRevision": 1, "impacted": ["u-2"],
+#     "cursor": 0, "completed": False, "remaining": 3}
 ```
 
 - 每推进一阶段消耗一个阶段；最后一个阶段推进成功后 `completed=True`、
@@ -183,6 +198,27 @@ svc.cancel_rollout_plan("new-checkout",
   （`impacted` 为排序后的实际影响列表），不建版本、不改当前 revision、
   不删计划。返回的 `cancelledStage` 取最近确认阶段的 name，未推进时为
   `None`。
+- `rollback_stage(flag_key, subjects, expected_impacted)` 回退最近确认阶段，
+  仅处理存在计划、`cursor > 0` 且当前 revision 等于最近确认值的计划。回退
+  目标 revision 为上一次 `advance_rollout_plan` 成功前的版本：回退首阶段时
+  为 `baseRevision`，回退后续阶段时为上一次推进的结果 revision。当前与目标
+  revision 顺序求值，主功能 enabled 翻转的 subject_id 去重、按字符串排序
+  计入影响；与 `expected_impacted` 一致才提交：恢复当前 revision、cursor
+  减一、confirmedRevision 更新为目标 revision，推进产生的历史 revision 与
+  后续阶段定义全部保留。回退末阶段（计划完成后）后 `completed=False`，计划
+  重新可推进；此后再调 `advance_rollout_plan` 即推进被回退的阶段，并分配
+  下一个未用正整数 revision（已有最大 revision + 1，不重用回退腾出的号）。
+  返回 `flagKey`、`rolledBackStage`（name/percentage/index）、
+  `restoredRevision`、`impacted`、`cursor`、`completed`、`remaining`；
+  `remaining` 为回退后 cursor 之后尚未确认的阶段数。
+- 回退影响面不符抛 `RolloutStageConflictError`（`impacted` 为排序后的实际
+  影响列表）；无计划、cursor 为 0 或当前 revision 偏离最近确认值抛
+  `RolloutPlanStateError`；`subjects` / `expected_impacted` 不可迭代、上下文
+  非 Mapping 或 subject_id 不可哈希抛 `InvalidRolloutChangeError`；放量缺
+  非空 `subject_id` 抛 `MissingSubjectError`；依赖版本缺失、缺主体、成环分别
+  抛 `RevisionNotFoundError`、`MissingSubjectError`、`PrerequisiteCycleError`；
+  未知 flag 抛 `FlagNotFoundError`。以上异常均不改当前 revision、cursor、
+  confirmedRevision 与计划，可用相同输入重试。
 - 阶段输入非法抛 `InvalidRolloutPlanError`；`subjects` / `expected_impacted`
   不可迭代或成员不可哈希抛 `InvalidRolloutChangeError`；放量缺非空
   `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
