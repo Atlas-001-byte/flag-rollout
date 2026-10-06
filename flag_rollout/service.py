@@ -100,6 +100,7 @@ class FeatureFlagService:
     - rollback：校验影响面后把当前版本切回目标 revision。
     - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
     - cancel_rollout_plan：取消未完成计划，把当前 revision 恢复为基准 revision。
+    - forecast_rollout_plan：只读预演剩余阶段的逐阶段影响面，不创建版本、不推进。
     """
 
     def __init__(self) -> None:
@@ -518,6 +519,107 @@ class FeatureFlagService:
             "restoredRevision": base_revision,
             "cancelledStage": cancelled_stage,
             "impacted": sorted(impacted, key=str),
+        }
+
+    # ------------------------------------------------------------------
+    # forecast_rollout_plan：只读预演剩余阶段影响面（不改变任何状态）
+    # ------------------------------------------------------------------
+    def forecast_rollout_plan(
+        self,
+        flag_key: str,
+        subjects: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """只读预演当前计划剩余阶段的逐阶段影响面；不创建版本、不推进计划。
+
+        以最近确认 revision 的 definition 为底稿，仅替换 rollout.percentage
+        模拟游标之后的各阶段；规则、enabled、放量桶顺序与 advance_rollout_plan
+        一致。首阶段对比当前 revision，后续阶段对比上一模拟阶段，enabled 发生
+        变化的 subject_id 去重、按字符串排序得到 impacted。cumulativeImpacted
+        为到该阶段的累计变化并集，totalImpacted 为剩余各阶段变化的并集，均
+        去重排序。forecast_revision 为连续推进将使用的版本号（已有最大
+        revision + 1 起的连续正整数）。
+
+        纯只读：不创建 revision，不改 current、cursor、confirmed_revision
+        与计划；相同状态和 subjects 重复调用结果一致。
+
+        无计划、计划已完成或当前 revision 偏离最近确认值抛
+        RolloutPlanStateError；subjects 不可迭代、上下文非 Mapping 或
+        subject_id 不可哈希抛 InvalidRolloutChangeError；进入放量判断但缺少
+        非空 subject_id 抛 MissingSubjectError；未知 flag 抛
+        FlagNotFoundError。以上错误均不改变任何状态。
+
+        返回 {"flagKey", "baseRevision", "currentRevision", "stages",
+        "totalImpacted"}；stages 与剩余阶段同序，每项含 name、percentage、
+        index、forecast_revision、impacted、cumulativeImpacted。
+        """
+        state = self._flags.get(flag_key)
+        if state is None:
+            raise FlagNotFoundError("flag_key=%r 尚未发布" % (flag_key,))
+
+        plan = self._plans.get(flag_key)
+        if (
+            plan is None
+            or plan.completed
+            or state.current != plan.confirmed_revision
+        ):
+            raise RolloutPlanStateError(
+                "flag_key=%r 没有可预演的放量计划（无计划、已完成或当前 revision "
+                "已偏离最近确认值）" % (flag_key,)
+            )
+
+        try:
+            subject_list = list(subjects)
+        except TypeError:
+            raise InvalidRolloutChangeError("subjects 必须可迭代")
+        for context in subject_list:
+            if not isinstance(context, Mapping):
+                raise InvalidRolloutChangeError("subjects 的每项必须是 Mapping")
+
+        current_revision = state.current
+        remaining_stages = plan.stages[plan.cursor:]
+        first_revision = max(state.revisions) + 1
+
+        # 底稿为最近确认 revision（状态校验后即当前 revision）的 definition；
+        # 每个模拟阶段仅替换 rollout.percentage，其余字段保持底稿语义。
+        base_definition = state.revisions[current_revision]
+        previous_definition = base_definition
+        cumulative: Set[Any] = set()
+        stage_results: List[Dict[str, Any]] = []
+        for offset, stage in enumerate(remaining_stages):
+            candidate = copy.deepcopy(base_definition)
+            candidate["rollout"]["percentage"] = stage["percentage"]
+            impacted: Set[Any] = set()
+            for context in subject_list:
+                before = self._evaluate_definition(
+                    flag_key, current_revision, previous_definition, context
+                )
+                after = self._evaluate_definition(
+                    flag_key, first_revision + offset, candidate, context
+                )
+                if before["enabled"] != after["enabled"]:
+                    try:
+                        impacted.add(context.get("subject_id"))
+                    except TypeError:
+                        raise InvalidRolloutChangeError("subject_id 必须可哈希")
+            cumulative |= impacted
+            stage_results.append(
+                {
+                    "name": stage["name"],
+                    "percentage": stage["percentage"],
+                    "index": stage["index"],
+                    "forecast_revision": first_revision + offset,
+                    "impacted": sorted(impacted, key=str),
+                    "cumulativeImpacted": sorted(cumulative, key=str),
+                }
+            )
+            previous_definition = candidate
+
+        return {
+            "flagKey": flag_key,
+            "baseRevision": plan.base_revision,
+            "currentRevision": current_revision,
+            "stages": stage_results,
+            "totalImpacted": sorted(cumulative, key=str),
         }
 
     @staticmethod

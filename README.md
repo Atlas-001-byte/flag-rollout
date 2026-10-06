@@ -124,6 +124,45 @@ svc.cancel_rollout_plan("new-checkout",
   `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
   以上错误均不改版本或计划。
 
+## 计划预演（forecast_rollout_plan）
+
+`forecast_rollout_plan(flag_key, subjects)` 是只读入口：在 `advance_rollout_plan`
+之前查看可推进计划剩余阶段的逐阶段影响面。它不替代 `preview_change`（后者预演
+候选配置），也不创建 revision、不改 `current` / `cursor` / `confirmed_revision`
+或计划；相同状态与 subjects 重复调用结果一致。
+
+以最近确认 revision 的 definition 为底稿，仅替换 `rollout.percentage` 模拟游标
+之后的各阶段（规则、enabled、放量桶顺序与推进一致）。首阶段对比当前 revision，
+后续阶段对比上一模拟阶段；`enabled` 变化的 `subject_id` 去重、按字符串排序得到
+`impacted`，`cumulativeImpacted` 为到该阶段的累计变化并集，`totalImpacted` 为
+剩余各阶段变化的并集。
+
+```python
+svc.create_rollout_plan("new-checkout", [
+    {"name": "canary", "percentage": 10},
+    {"name": "beta", "percentage": 50},
+    {"name": "full", "percentage": 100},
+])
+svc.forecast_rollout_plan("new-checkout",
+                          subjects=[{"subject_id": "u-1"}, {"subject_id": "u-2"}])
+# -> {"flagKey": "new-checkout", "baseRevision": 1, "currentRevision": 1,
+#     "stages": [
+#       {"name": "canary", "percentage": 10, "index": 0, "forecast_revision": 2,
+#        "impacted": [...], "cumulativeImpacted": [...]},
+#       {"name": "beta",  "percentage": 50, "index": 1, "forecast_revision": 3, ...},
+#       {"name": "full", "percentage": 100, "index": 2, "forecast_revision": 4, ...},
+#     ],
+#     "totalImpacted": [...]}
+```
+
+- `stages` 与剩余阶段同序；`forecast_revision` 是连续推进将使用的第一版本号
+  （已有最大 revision + 1）及后续连续版本号。
+- 无未完成计划、计划已完成或当前 revision 偏离最近确认值抛
+  `RolloutPlanStateError`；`subjects` 不可迭代、上下文非 Mapping 或
+  `subject_id` 不可哈希抛 `InvalidRolloutChangeError`；进入放量判断但缺少非空
+  `subject_id` 抛 `MissingSubjectError`；未知 flag 抛 `FlagNotFoundError`。
+  以上错误均不改变任何状态。
+
 ## 预演（preview_change）
 
 `preview_change(request)` 是独立的只读公开入口，用来在真正提交配置前，看清同一批
