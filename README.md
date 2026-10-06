@@ -15,6 +15,7 @@
 - `RevisionConflictError`：同一 flag_key 下 revision 已存在，版本不可修改。
 - `FlagNotFoundError` / `RevisionNotFoundError`：求值或回滚时目标不存在。
 - `MissingSubjectError`：放量求值需要非空 `subject_id`。
+- `PrerequisiteCycleError`：前置依赖链出现自环或成环。
 - `RollbackConflictError`：回滚实际影响面与预期不一致，当前版本不变。
 - `InvalidRolloutChangeError`：promote_rollout 参数无效（percentage 类型/范围、subjects/expected_impacted 不可迭代或成员不可哈希）。
 - `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
@@ -47,7 +48,8 @@ svc.publish("new-checkout", 1, {
 # 前 8 字节大端整数 % 10000，bucket < percentage * 100 时取 rollout.serve。
 svc.evaluate("new-checkout", {"subject_id": "u-1", "plan": "pro"})
 # -> {"enabled": True, "reason": "rule", "revision": 1, "bucket": None}
-# reason ∈ {"disabled", "rule", "rollout", "default"}；未进入放量时 bucket 为 None。
+# reason ∈ {"disabled", "rule", "rollout", "default", "prerequisite"}；
+# 未进入放量时 bucket 为 None，前置依赖不满足时 reason=prerequisite、bucket=None。
 
 # rollback：校验影响面后激活目标 revision；不一致抛 RollbackConflictError 且不改版本。
 svc.rollback("new-checkout", 1,
@@ -65,6 +67,76 @@ svc.promote_rollout("new-checkout", 50,
 ```
 
 指定 `revision` 的求值结果固定；已发布版本不可修改。
+
+## 前置依赖门控（prerequisites）
+
+definition 可携带可选的 `prerequisites` 列表，在既有“规则 → enabled → 放量桶
+→ default”求值之前增加前置 Feature Flag 依赖门控。省略该字段、为 `null` 或空
+列表时无门控，所有既有入口行为完全不变。每项依赖：
+
+- `flagKey`：非空字符串，必填。
+- `revision`：可选正整数；省略（或 `null`）时读该依赖 flag 的**当前**版本，
+  指定时固定读该历史版本。
+- `expected`：可选布尔；省略时视为 `True`。
+
+`evaluate` 按列表顺序逐项解析依赖：在**同一 context** 上递归执行该依赖自身的
+prerequisites 语义，依赖结果（serve 值按 `bool(...)` 归一化）等于 `expected`
+才继续下一项；前一项不满足即停止，不再解析后续依赖，也不执行主功能自身的规则
+与放量，直接返回：
+
+```python
+{"enabled": False, "reason": "prerequisite",
+ "revision": <主功能被求值的 revision>, "bucket": None}
+```
+
+全部依赖满足后，沿用既有规则、放量、`default` 的顺序、返回结构与桶算法，桶
+（`SHA-256(flag_key:salt:subject_id) % 10000`）保持不变。
+
+```python
+svc.publish("kill-switch", 1, {
+    "enabled": True, "default": False, "rules": [],
+    "rollout": {"percentage": 100, "salt": "ks", "serve": True},
+})
+svc.publish("new-checkout", 2, {
+    "enabled": True, "default": False, "rules": [],
+    "rollout": {"percentage": 25, "salt": "exp-7", "serve": True},
+    "prerequisites": [
+        {"flagKey": "kill-switch"},                       # 读当前版本，expected 缺省 True
+        {"flagKey": "legacy-api", "revision": 3},        # 固定读 revision=3
+        {"flagKey": "maint-mode", "expected": False},    # 要求维护开关为关
+    ],
+})
+```
+
+错误语义（均不改变服务状态，相同输入可安全重试）：
+
+- 依赖链出现自环或成环抛 `PrerequisiteCycleError`（按 `(flagKey, revision)`
+  节点判环；依赖指向本 flag 的**另一个** revision 不构成环）。
+- 依赖 `flagKey` 从未发布抛 `FlagNotFoundError`；指定的 `revision` 不存在抛
+  `RevisionNotFoundError`。
+- 依赖求值进入放量分支但 context 缺非空 `subject_id` 时抛 `MissingSubjectError`；
+  依赖命中规则或主功能命中规则时不需要 `subject_id`。
+- publish 时 `prerequisites` 形状非法（非列表、项非对象、`flagKey` 非空字符串
+  不成立、`revision` 非正整数/布尔、`expected` 非布尔）抛
+  `InvalidDefinitionError`，且不创建版本。
+
+门控为所有求值入口共用：`rollback`、`promote_rollout`、多阶段放量计划的
+`advance_rollout_plan` / `forecast_rollout_plan` / `cancel_rollout_plan` 与
+`preview_change` 都在同一门控下求值。影响面仍只统计**主功能** `enabled` 翻转的
+`subject_id`，去重、按字符串排序与 conflict 语义保持不变；依赖自身在不同版本
+下的决策变化不直接计入影响面。历史 revision 可指定求值，指定版本固定读其发布
+时的定义及其依赖语义。相同状态与输入重复调用结果一致，不增加网络、持久化、
+定时器、并发或恢复。
+
+### preview_change 中的候选依赖
+
+`preview_change` 的候选 `definition` 也可声明 `prerequisites`，按**当前已发布
+状态**解析（候选本身尚未发布）：依赖不满足时候选决策为 `False`（不命中任何
+候选阶段），依赖满足时正常进入候选规则/阶段求值；现行版本（`before`）按其已
+发布定义的门控求值。依赖解析异常——`FlagNotFoundError`、`RevisionNotFoundError`、
+`MissingSubjectError`、`PrerequisiteCycleError`——直接抛出，**不**归为
+`PreviewValidationError` 的 422；只有候选 definition 的结构形状非法（含
+prerequisites 字段形状错误）才返回 `candidate_not_evaluable`（422）。
 
 ## 多阶段放量计划（create_rollout_plan / advance_rollout_plan）
 
@@ -268,7 +340,7 @@ svc.preview_change({
 | `stage_percentage_invalid` | 阶段比例不是 [0, 100] 内数值 |
 | `stage_percentages_not_non_decreasing` | 阶段比例未按非递减排列 |
 | `stage_overlap` | 同一上下文在两个候选阶段同时命中 |
-| `candidate_not_evaluable` | 候选配置无法按既有语义求值（结构非法或缺 subject_id） |
+| `candidate_not_evaluable` | 候选配置无法按既有语义求值（结构非法，含 `prerequisites` 字段形状错误；或缺 subject_id）。注意候选依赖解析期的 `FlagNotFoundError` / `RevisionNotFoundError` / `MissingSubjectError` / `PrerequisiteCycleError` 直接抛出，不是 422 |
 
 未知 `flagKey` 沿用现有 `FlagNotFoundError`（与 evaluate/rollback/promote_rollout
 一致，不纳入 422 错误码表）。

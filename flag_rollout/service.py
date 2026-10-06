@@ -32,6 +32,7 @@ from .errors import (
     InvalidRolloutChangeError,
     InvalidRolloutPlanError,
     MissingSubjectError,
+    PrerequisiteCycleError,
     PreviewValidationError,
     RevisionConflictError,
     RevisionNotFoundError,
@@ -48,6 +49,7 @@ REASON_DISABLED = "disabled"
 REASON_RULE = "rule"
 REASON_ROLLOUT = "rollout"
 REASON_DEFAULT = "default"
+REASON_PREREQUISITE = "prerequisite"
 
 _BUCKET_BASE = 10000
 
@@ -96,7 +98,7 @@ class FeatureFlagService:
     """进程内 Feature Flag 服务。
 
     - publish：保存 flag_key 某个正整数 revision 的 definition，并激活该版本。
-    - evaluate：按规则 → enabled → 放量桶的顺序求值。
+    - evaluate：前置依赖门控 → 规则 → enabled → 放量桶的顺序求值。
     - rollback：校验影响面后把当前版本切回目标 revision。
     - create_rollout_plan / advance_rollout_plan：登记并逐阶段推进多阶段放量计划。
     - forecast_rollout_plan：只读预演剩余阶段的影响面，不创建 revision、不推进。
@@ -141,7 +143,10 @@ class FeatureFlagService:
     ) -> Dict[str, Any]:
         """对 context 求值，返回 {"enabled", "reason", "revision", "bucket"}。
 
-        未指定 revision 时使用当前激活版本。未进入放量阶段时 bucket 为 None。
+        未指定 revision 时使用当前激活版本。先按 prerequisites 顺序递归门控，
+        任一依赖不满足时返回 enabled=False、reason=prerequisite、revision 为
+        被求值的主功能 revision、bucket=None；全部满足后沿用既有顺序求值。
+        未进入放量阶段时 bucket 为 None。
         """
         state = self._flags.get(flag_key)
         if state is None:
@@ -821,14 +826,25 @@ class FeatureFlagService:
         zero_definition = copy.deepcopy(validated_candidate)
         zero_definition["rollout"]["percentage"] = 0
 
-        def safe_evaluate(definition: Mapping[str, Any], context: Mapping[str, Any]) -> tuple:
-            try:
-                return self._evaluate_core(flag_key, definition, context)
-            except MissingSubjectError as exc:
-                raise PreviewValidationError(
-                    PREVIEW_ERROR_CANDIDATE_EVALUATION,
-                    "候选配置无法按既有语义求值：%s" % exc,
-                )
+        def gated_evaluate(
+            definition: Mapping[str, Any],
+            context: Mapping[str, Any],
+            owner_revision: Optional[int],
+        ) -> tuple:
+            # 已发布的现行定义按真实 (flag_key, current_revision) 作为根节点；
+            # 候选定义尚未发布，用 (flag_key, None) 作为唯一根节点，使其对本 flag
+            # 当前已发布版本的依赖（固定版本或读当前版本）按已发布状态解析并自然
+            # 终止，而不会与根节点撞名误报成环。依赖缺失、版本不存在、成环或缺
+            # subject_id 等求值期异常直接抛出（与 evaluate 同语义，不归类为
+            # PreviewValidationError 的 422）；依赖不满足时返回
+            # reason=prerequisite，决策按 False 处理。
+            return self._evaluate_with_prerequisites(
+                flag_key,
+                owner_revision,
+                definition,
+                context,
+                active=frozenset([(flag_key, owner_revision)]),
+            )
 
         results: List[Dict[str, Any]] = []
         affected: Set[Any] = set()
@@ -844,7 +860,7 @@ class FeatureFlagService:
             context = entry["context"]
 
             before_value, _before_reason, before_rule, _before_bucket = (
-                self._evaluate_core(flag_key, current_definition, context)
+                gated_evaluate(current_definition, context, current_revision)
             )
 
             matched_stage = None
@@ -853,7 +869,9 @@ class FeatureFlagService:
             candidate_rule = None
             candidate_bucket = None
             for stage, definition in zip(normalized_stages, stage_definitions):
-                value, reason, rule_id, bucket = safe_evaluate(definition, context)
+                value, reason, rule_id, bucket = gated_evaluate(
+                    definition, context, None
+                )
                 if reason == REASON_ROLLOUT:
                     stage_hits[stage["name"]].add(subject_key)
                     if matched_stage is not None:
@@ -878,7 +896,7 @@ class FeatureFlagService:
             # 未命中任何候选阶段：回退到候选配置本身（percentage=0 的同构求值）。
             if matched_stage is None:
                 candidate_value, candidate_reason, candidate_rule, candidate_bucket = (
-                    safe_evaluate(zero_definition, context)
+                    gated_evaluate(zero_definition, context, None)
                 )
 
             before_bool = bool(before_value)
@@ -934,8 +952,76 @@ class FeatureFlagService:
         definition: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        value, reason, _rule_id, bucket = self._evaluate_core(flag_key, definition, context)
+        """带前置依赖门控的求值，返回与 evaluate 相同的结构。
+
+        按 prerequisites 顺序递归解析依赖：指定 revision 固定读该版本，否则
+        读当前版本；依赖结果等于 expected 才继续，任一不满足即停止并返回
+        enabled=False、reason=prerequisite、revision=主功能 revision、
+        bucket=None。全部满足后沿用既有规则 → enabled → 放量桶 → default
+        顺序求值，桶与返回结构不变。
+        """
+        value, reason, _rule_id, bucket = self._evaluate_with_prerequisites(
+            flag_key,
+            revision,
+            definition,
+            context,
+            active=frozenset([(flag_key, revision)]),
+        )
         return self._result(value, reason, revision, bucket)
+
+    def _evaluate_with_prerequisites(
+        self,
+        flag_key: str,
+        revision: Optional[int],
+        definition: Mapping[str, Any],
+        context: Mapping[str, Any],
+        active: frozenset,
+    ) -> tuple:
+        """在 _evaluate_core 之前叠加递归前置门控。
+
+        ``active`` 为当前依赖链上已在求值的 (flag_key, revision) 节点；依赖
+        节点再次出现即构成自环/成环，抛 PrerequisiteCycleError。依赖未知、
+        指定版本不存在分别抛 FlagNotFoundError / RevisionNotFoundError；依赖
+        自身进入放量但缺非空 subject_id 时抛 MissingSubjectError。依赖不满足
+        时返回 (False, "prerequisite", None, None)。
+        """
+        for prereq in definition.get("prerequisites", ()):
+            dep_key = prereq["flagKey"]
+            dep_state = self._flags.get(dep_key)
+            if dep_state is None:
+                raise FlagNotFoundError("前置依赖 flag_key=%r 尚未发布" % (dep_key,))
+            dep_revision = prereq["revision"]
+            if dep_revision is None:
+                dep_revision = dep_state.current
+            elif dep_revision not in dep_state.revisions:
+                raise RevisionNotFoundError(
+                    "前置依赖 flag_key=%r 不存在 revision=%r" % (dep_key, dep_revision)
+                )
+            dep_node = (dep_key, dep_revision)
+            if dep_node in active:
+                # 候选定义（preview）的根节点 revision 为 None，排序键需兼容。
+                chain = " -> ".join(
+                    "%s@%s" % (key, "current" if rev is None else rev)
+                    for key, rev in sorted(
+                        active, key=lambda node: (node[0], node[1] if node[1] is not None else -1)
+                    )
+                )
+                raise PrerequisiteCycleError(
+                    "前置依赖成环：%s -> %s@%r" % (chain, dep_key, dep_revision)
+                )
+            dep_value, _dep_reason, _dep_rule, _dep_bucket = (
+                self._evaluate_with_prerequisites(
+                    dep_key,
+                    dep_revision,
+                    dep_state.revisions[dep_revision],
+                    context,
+                    active=active | {dep_node},
+                )
+            )
+            if bool(dep_value) != prereq["expected"]:
+                return False, REASON_PREREQUISITE, None, None
+
+        return self._evaluate_core(flag_key, definition, context)
 
     def _evaluate_core(
         self,
@@ -1044,7 +1130,44 @@ class FeatureFlagService:
         if not isinstance(rollout["salt"], str):
             raise InvalidDefinitionError("rollout.salt 必须是字符串")
 
-        return copy.deepcopy(dict(definition))
+        # prerequisites 可省略；缺省或空列表表示无前置门控，既有求值入口不变。
+        # 每项规范化为 {"flagKey", "revision", "expected"}：revision 缺省为
+        # None（求值时读当前版本），expected 缺省为 True。
+        prerequisites: List[Dict[str, Any]] = []
+        if "prerequisites" in definition and definition["prerequisites"] is not None:
+            raw_prerequisites = definition["prerequisites"]
+            if not isinstance(raw_prerequisites, (list, tuple)):
+                raise InvalidDefinitionError("prerequisites 必须是列表")
+            for index, prereq in enumerate(raw_prerequisites):
+                where = "prerequisites[%d]" % index
+                if not isinstance(prereq, Mapping):
+                    raise InvalidDefinitionError("%s 必须是 Mapping" % where)
+                dep_key = prereq.get("flagKey")
+                if not isinstance(dep_key, str) or not dep_key:
+                    raise InvalidDefinitionError("%s.flagKey 必须是非空字符串" % where)
+                dep_revision = prereq.get("revision")
+                if dep_revision is not None and (
+                    isinstance(dep_revision, bool)
+                    or not isinstance(dep_revision, int)
+                    or dep_revision <= 0
+                ):
+                    raise InvalidDefinitionError(
+                        "%s.revision 必须是正整数或省略" % where
+                    )
+                expected = prereq.get("expected", True)
+                if not isinstance(expected, bool):
+                    raise InvalidDefinitionError("%s.expected 必须是布尔值或省略" % where)
+                prerequisites.append(
+                    {
+                        "flagKey": dep_key,
+                        "revision": dep_revision,
+                        "expected": expected,
+                    }
+                )
+
+        normalized = copy.deepcopy(dict(definition))
+        normalized["prerequisites"] = prerequisites
+        return normalized
 
     @staticmethod
     def _validate_rule(index: int, rule: Any) -> None:
