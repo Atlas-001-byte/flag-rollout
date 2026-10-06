@@ -15,6 +15,7 @@
 - `RevisionConflictError`：同一 flag_key 下 revision 已存在，版本不可修改。
 - `FlagNotFoundError` / `RevisionNotFoundError`：求值或回滚时目标不存在。
 - `MissingSubjectError`：放量求值需要非空 `subject_id`。
+- `PrerequisiteCycleError`：前置依赖链出现自环或成环。
 - `RollbackConflictError`：回滚实际影响面与预期不一致，当前版本不变。
 - `InvalidRolloutChangeError`：promote_rollout 参数无效（percentage 类型/范围、subjects/expected_impacted 不可迭代或成员不可哈希）。
 - `RolloutConflictError`：放量晋升实际影响面与预期不一致，不创建候选版本，当前版本不变。
@@ -47,7 +48,8 @@ svc.publish("new-checkout", 1, {
 # 前 8 字节大端整数 % 10000，bucket < percentage * 100 时取 rollout.serve。
 svc.evaluate("new-checkout", {"subject_id": "u-1", "plan": "pro"})
 # -> {"enabled": True, "reason": "rule", "revision": 1, "bucket": None}
-# reason ∈ {"disabled", "rule", "rollout", "default"}；未进入放量时 bucket 为 None。
+# reason ∈ {"disabled", "rule", "rollout", "default", "prerequisite"}；
+# 未进入放量或前置依赖不满足时 bucket 为 None。
 
 # rollback：校验影响面后激活目标 revision；不一致抛 RollbackConflictError 且不改版本。
 svc.rollback("new-checkout", 1,
@@ -65,6 +67,68 @@ svc.promote_rollout("new-checkout", 50,
 ```
 
 指定 `revision` 的求值结果固定；已发布版本不可修改。
+
+## 前置 Feature Flag 依赖门控（prerequisites）
+
+definition 可带可选的 `prerequisites` 列表，在规则 → enabled → 放量桶 → default
+**之前**先做依赖门控。列表可省略或为空，此时既有入口行为完全不变；不增加网络、
+持久化、定时器、并发或恢复机制。
+
+每项依赖：
+
+- `flagKey`：非空字符串，必填，指向另一个（或自身，见成环）已发布 flag。
+- `revision`：可选正整数。指定时固定读该版本；省略时读该依赖 flag 的当前激活版本。
+- `expected`：可选布尔，**省略时缺省为 `True`**。
+
+```python
+# 依赖开关：kill-switch 全量开启时主功能才放行。
+svc.publish("kill-switch", 1, {
+    "enabled": True, "default": False, "rules": [],
+    "rollout": {"percentage": 100, "salt": "ks", "serve": True},
+})
+svc.publish("new-checkout", 2, {
+    "enabled": True, "default": False, "rules": [],
+    "rollout": {"percentage": 25, "salt": "exp-7", "serve": True},
+    "prerequisites": [
+        {"flagKey": "kill-switch"},                      # revision 省略读当前，expected 缺省 True
+        {"flagKey": "contract-v2", "revision": 3},      # 固定读 revision=3
+        {"flagKey": "maintenance", "expected": False},  # 要求该 flag 求值为 False
+    ],
+})
+```
+
+求值语义：
+
+- 按 `prerequisites` 列表顺序在**同一 context** 上递归求值每个依赖：依赖自身的
+  `prerequisites` 按同样语义先解析（可任意嵌套、可固定历史版本）。
+- 前一项不满足立即停止（短路）；某依赖的求值结果 `enabled` 等于其 `expected`
+  才继续。全部满足后，主功能沿用既有的规则 → 放量 → default 顺序与结构，桶不变。
+- 任一依赖不满足时返回
+  `{"enabled": False, "reason": "prerequisite", "revision": 主功能 revision, "bucket": None}`。
+  `reason` 新增取值 `"prerequisite"`。
+- 依赖自环或成环抛 `PrerequisiteCycleError`；依赖 `flagKey` 未发布抛
+  `FlagNotFoundError`；指定 `revision` 不存在抛 `RevisionNotFoundError`；依赖求值
+  进入放量但 context 缺非空 `subject_id` 抛 `MissingSubjectError`。以上异常均不
+  改变服务状态（可修正后用相同输入重试）。
+- `publish` 时 `prerequisites` 形状非法（非列表、项非对象、`flagKey` 非非空字符串、
+  `revision` 非正整数、`expected` 非布尔）抛 `InvalidDefinitionError`，且不创建版本。
+  环是运行期概念，publish 不校验依赖是否存在或成环。
+- 相同输入重复调用结果一致；对主功能指定历史 `revision` 求值时，使用该历史版本
+  自带的 `prerequisites`（含其中固定/当前版本的解析口径）。
+
+门控为所有共享入口的公共前置：`evaluate`、`rollback`、`promote_rollout`、
+多阶段放量计划入口（`create_rollout_plan` 仅登记不求值；`advance_rollout_plan` /
+`forecast_rollout_plan` / `cancel_rollout_plan` 求值时经门控）与 `preview_change`
+一致。影响面仍只统计**主功能** `enabled` 翻转的 `subject_id`，并保留去重、按字符串
+排序与 conflict 语义；依赖自身的 reason/bucket 变化不计入影响。
+
+`preview_change` 的候选 `definition` 可声明依赖，并按**当前已发布状态**解析：
+
+- 候选依赖不满足时，该 context 的候选决策（`after`）为 `False`，候选灰度阶段不命中。
+- 依赖缺失（`FlagNotFoundError`）、版本不存在（`RevisionNotFoundError`）、依赖进入
+  放量却缺非空 subject（`MissingSubjectError`）或依赖成环（`PrerequisiteCycleError`）
+  原样抛出，**不**归为 `PreviewValidationError` 的 422；只有候选 `definition` 自身的
+  结构形状非法（含 `prerequisites` 形状非法）才映射为 `candidate_not_evaluable`（422）。
 
 ## 多阶段放量计划（create_rollout_plan / advance_rollout_plan）
 
@@ -268,10 +332,12 @@ svc.preview_change({
 | `stage_percentage_invalid` | 阶段比例不是 [0, 100] 内数值 |
 | `stage_percentages_not_non_decreasing` | 阶段比例未按非递减排列 |
 | `stage_overlap` | 同一上下文在两个候选阶段同时命中 |
-| `candidate_not_evaluable` | 候选配置无法按既有语义求值（结构非法或缺 subject_id） |
+| `candidate_not_evaluable` | 候选配置结构形状非法（含 `prerequisites` 形状非法），无法按既有语义求值 |
 
 未知 `flagKey` 沿用现有 `FlagNotFoundError`（与 evaluate/rollback/promote_rollout
-一致，不纳入 422 错误码表）。
+一致，不纳入 422 错误码表）。候选/现行 `prerequisites` 在求值期解析出的
+`FlagNotFoundError`、`RevisionNotFoundError`、`MissingSubjectError`、
+`PrerequisiteCycleError` 同样原样抛出，不属于 422。
 
 ## 测试
 

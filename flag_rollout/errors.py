@@ -28,6 +28,10 @@ class MissingSubjectError(FlagRolloutError):
     """放量求值需要非空的 subject_id，但 context 中缺失或为空。"""
 
 
+class PrerequisiteCycleError(FlagRolloutError):
+    """依赖链上出现自环或成环（A 依赖 B，B 又直接或间接依赖 A）。"""
+
+
 class RollbackConflictError(FlagRolloutError):
     """回滚实际影响面与预期不一致，当前版本保持不变。"""
 
